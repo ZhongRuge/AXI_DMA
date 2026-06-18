@@ -23,9 +23,9 @@
 #define STREAM_STATUS_ERROR    BIT(1)
 
 struct stream_ctrl_dev {
-    struct device *dev;
-    void __iomem *base;
-    struct resource *res;
+    struct device *dev; // Linux设备对象的指针 资源管理
+    void __iomem *base; // 映射后的虚拟基地址
+    struct resource *res; // 保存物理地址资源
 };
 
 #endif
