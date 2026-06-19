@@ -2,6 +2,8 @@
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/err.h>
+#include <linux/of.h>
+#include <linux/module.h>
 #include "stream_ctrl.h"
 
 /* 从 MMIO 基地址读取 4 个寄存器并打印 */
@@ -55,6 +57,19 @@ static int stream_ctrl_probe(struct platform_device *pdev)
     dev_info(&pdev->dev, "ioremap success!\n");
 
     stream_ctrl_dump_regs(sdev);
+
+    return 0;
+}
+
+static int stream_ctrl_remove(struct platform_device *pdev)
+{
+    struct stream_ctrl_dev *sdev;
+
+    sdev = platform_get_drvdata(pdev);
+    dev_info(&pdev->dev, "stream_ctrl: remove called!\n");
+
+    if (sdev) 
+        dev_info(&sdev->dev, "stream_ctrl: resources will be released by devm\n");
 
     return 0;
 }
