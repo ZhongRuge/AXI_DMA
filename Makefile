@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-KERN_DIR :=/home/zy/workspace/kernel-driver/linux-xlnx-xlnx_rebase_v5.4_2020.2
+KERN_DIR := /home/zy/workspace/kernel-driver/linux-xlnx-xlnx_rebase_v5.4_2020.2
 PETALINUX_ENV := /opt/petalinux/2020.2/environment-setup-cortexa9t2hf-neon-xilinx-linux-gnueabi
 
 ARCH := arm

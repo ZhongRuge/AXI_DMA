@@ -48,13 +48,13 @@ static int stream_ctrl_probe(struct platform_device *pdev)
 
     sdev->base = devm_ioremap_resource(&pdev->dev, res);
     if (IS_ERR(sdev->base)) {
-        dev_err(&pdev->dev, "ioremap error!\n");
+        dev_err(&pdev->dev, "stream_ctrl: ioremap failed\n");
         return PTR_ERR(sdev->base);
     }
 
     /* 绑定pdev和sdev 便于后续访问 */
     platform_set_drvdata(pdev, sdev);
-    dev_info(&pdev->dev, "ioremap success!\n");
+    dev_info(&pdev->dev, "stream_ctrl: ioremap success\n");
 
     stream_ctrl_dump_regs(sdev);
 
@@ -64,12 +64,34 @@ static int stream_ctrl_probe(struct platform_device *pdev)
 static int stream_ctrl_remove(struct platform_device *pdev)
 {
     struct stream_ctrl_dev *sdev;
-
     sdev = platform_get_drvdata(pdev);
-    dev_info(&pdev->dev, "stream_ctrl: remove called!\n");
+    dev_info(&pdev->dev, "stream_ctrl: remove called\n");
 
-    if (sdev) 
-        dev_info(&sdev->dev, "stream_ctrl: resources will be released by devm\n");
+    if (sdev)
+        dev_info(&pdev->dev, "stream_ctrl: resources will be released by devm\n");
 
     return 0;
 }
+
+static const struct of_device_id stream_ctrl_of_match[] = {
+    {.compatible = STREAM_CTRL_COMPATIBLE },
+    { }
+};
+
+MODULE_DEVICE_TABLE(of, stream_ctrl_of_match);
+
+static struct platform_driver stream_ctrl_driver = {
+    .probe = stream_ctrl_probe,
+    .remove = stream_ctrl_remove,
+    .driver = {
+        .name = STREAM_CTRL_DRV_NAME,
+        .of_match_table = stream_ctrl_of_match,
+    }
+};
+
+module_platform_driver(stream_ctrl_driver);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ZRG");
+MODULE_DESCRIPTION("Zynq stream control platform driver");
+
