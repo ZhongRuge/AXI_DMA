@@ -6,7 +6,6 @@
 #include <linux/module.h>
 #include "stream_ctrl.h"
 
-
 static u32 stream_ctrl_read(struct stream_ctrl_dev *sdev, u32 reg)
 {
     return readl(sdev->base + reg);
@@ -67,7 +66,7 @@ static int stream_ctrl_probe(struct platform_device *pdev)
         return -ENODEV;
     }
     sdev->res = res;
-    dev_info(sdev->dev, "stream_ctrl: resource = %pR\n", res);
+    dev_info(&pdev->dev, "stream_ctrl: resource = %pR\n", res);
 
     sdev->base = devm_ioremap_resource(&pdev->dev, res);
     if (IS_ERR(sdev->base)) {
@@ -117,7 +116,7 @@ u32 stream_ctrl_hw_get_status(struct stream_ctrl_dev *sdev)
 }
 
 static const struct of_device_id stream_ctrl_of_match[] = {
-    {.compatible = STREAM_CTRL_COMPATIBLE },
+    { .compatible = STREAM_CTRL_COMPATIBLE },
     { }
 };
 
