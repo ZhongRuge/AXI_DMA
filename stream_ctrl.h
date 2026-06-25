@@ -28,4 +28,9 @@ struct stream_ctrl_dev {
     struct resource *res; // 保存物理地址资源
 };
 
+void stream_ctrl_hw_start(struct stream_ctrl_dev *sdev);
+void stream_ctrl_hw_stop(struct stream_ctrl_dev *sdev);
+void stream_ctrl_hw_reset(struct stream_ctrl_dev *sdev);
+u32 stream_ctrl_hw_get_status(struct stream_ctrl_dev *sdev);
+
 #endif

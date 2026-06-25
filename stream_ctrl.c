@@ -6,6 +6,17 @@
 #include <linux/module.h>
 #include "stream_ctrl.h"
 
+
+static u32 stream_ctrl_read(struct stream_ctrl_dev *sdev, u32 reg)
+{
+    return readl(sdev->base + reg);
+}
+
+static void stream_ctrl_write(struct stream_ctrl_dev *sdev, u32 reg, u32 value)
+{
+    writel(value, sdev->base + reg);
+}
+
 /* 从 MMIO 基地址读取 4 个寄存器并打印 */
 static void stream_ctrl_dump_regs(struct stream_ctrl_dev *sdev)
 {
@@ -14,10 +25,10 @@ static void stream_ctrl_dump_regs(struct stream_ctrl_dev *sdev)
     u32 frame_len;
     u32 version;
 
-    ctrl = readl(sdev->base + STREAM_REG_CTRL);
-    status = readl(sdev->base + STREAM_REG_STATUS);
-    frame_len = readl(sdev->base + STREAM_REG_FRAME_LEN);
-    version = readl(sdev->base + STREAM_REG_VERSION);
+    ctrl = stream_ctrl_read(sdev, STREAM_REG_CTRL);
+    status = stream_ctrl_read(sdev, STREAM_REG_STATUS);
+    frame_len = stream_ctrl_read(sdev, STREAM_REG_FRAME_LEN);
+    version = stream_ctrl_read(sdev, STREAM_REG_VERSION);
 
     dev_info(sdev->dev, "stream_ctrl: CTRL      = 0x%08x\n", ctrl);
     dev_info(sdev->dev, "stream_ctrl: STATUS    = 0x%08x\n", status);
@@ -71,6 +82,26 @@ static int stream_ctrl_remove(struct platform_device *pdev)
         dev_info(&pdev->dev, "stream_ctrl: resources will be released by devm\n");
 
     return 0;
+}
+
+void stream_ctrl_hw_start(struct stream_ctrl_dev *sdev)
+{
+    stream_ctrl_write(sdev, STREAM_REG_CTRL, STREAM_CTRL_START);
+}
+
+void stream_ctrl_hw_stop(struct stream_ctrl_dev *sdev)
+{
+    stream_ctrl_write(sdev, STREAM_REG_CTRL, STREAM_CTRL_STOP);
+}
+
+void stream_ctrl_hw_reset(struct stream_ctrl_dev *sdev)
+{
+    stream_ctrl_write(sdev, STREAM_REG_CTRL, STREAM_CTRL_RESET);
+}
+
+u32 stream_ctrl_hw_get_status(struct stream_ctrl_dev *sdev)
+{
+    return stream_ctrl_read(sdev, STREAM_REG_STATUS);
 }
 
 static const struct of_device_id stream_ctrl_of_match[] = {
