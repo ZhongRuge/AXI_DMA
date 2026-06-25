@@ -8,24 +8,31 @@
 #include <linux/bitops.h>
 
 #define STREAM_CTRL_DRV_NAME       "stream_ctrl"
+
+/* FIXME: bring-up placeholder, replace with real compatible after Week 2 */
 #define STREAM_CTRL_COMPATIBLE     "xlnx,PWM-2.0"
+#define STREAM_CTRL_COMPATIBLE_FUTURE "zrg,zynq-stream-axidma"
 
-#define STREAM_REG_CTRL        0x00
-#define STREAM_REG_STATUS      0x04
-#define STREAM_REG_FRAME_LEN   0x08
-#define STREAM_REG_VERSION     0x0c
+#define STREAM_REG_CTRL               0x00  /* Control register */
+#define STREAM_REG_STATUS             0x04  /* Status register */
+#define STREAM_REG_PACKET_LEN         0x08  /* Packet length */
+#define STREAM_REG_RATE_DIV           0x0c  /* Rate divider */
+#define STREAM_REG_WORD_COUNT         0x10  /* Total words transferred */
+#define STREAM_REG_PACKET_COUNT       0x14  /* Total packets transferred */
+#define STREAM_REG_BACKPRESSURE_COUNT 0x18  /* Backpressure count */
+#define STREAM_REG_VERSION            0x1c  /* IP version */
 
-#define STREAM_CTRL_START      BIT(0)
-#define STREAM_CTRL_STOP       BIT(1)
-#define STREAM_CTRL_RESET      BIT(2)
+#define STREAM_CTRL_ENABLE    BIT(0)  /* Enable data stream */
+#define STREAM_CTRL_RESET     BIT(1)  /* Reset IP core */
 
-#define STREAM_STATUS_BUSY     BIT(0)
-#define STREAM_STATUS_ERROR    BIT(1)
+#define STREAM_STATUS_RUNNING        BIT(0)  /* Stream is running */
+#define STREAM_STATUS_ERROR          BIT(1)  /* Error occurred */
+#define STREAM_STATUS_BACKPRESSURE   BIT(2)  /* Backpressure asserted */
 
 struct stream_ctrl_dev {
-    struct device *dev; // Linux设备对象的指针 资源管理
-    void __iomem *base; // 映射后的虚拟基地址
-    struct resource *res; // 保存物理地址资源
+    struct device *dev;      /* Linux 设备对象 */
+    void __iomem *base;      /* MMIO 虚拟基地址 */
+    struct resource *res;    /* 物理地址资源 */
 };
 
 void stream_ctrl_hw_start(struct stream_ctrl_dev *sdev);

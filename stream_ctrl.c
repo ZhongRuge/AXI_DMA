@@ -17,23 +17,35 @@ static void stream_ctrl_write(struct stream_ctrl_dev *sdev, u32 reg, u32 value)
     writel(value, sdev->base + reg);
 }
 
-/* 从 MMIO 基地址读取 4 个寄存器并打印 */
+/* 从 MMIO 基地址读取 8 个寄存器并打印 */
 static void stream_ctrl_dump_regs(struct stream_ctrl_dev *sdev)
 {
     u32 ctrl;
     u32 status;
-    u32 frame_len;
+    u32 packet_len;
+    u32 rate_div;
+    u32 word_count;
+    u32 packet_count;
+    u32 backpressure_count;
     u32 version;
 
-    ctrl = stream_ctrl_read(sdev, STREAM_REG_CTRL);
-    status = stream_ctrl_read(sdev, STREAM_REG_STATUS);
-    frame_len = stream_ctrl_read(sdev, STREAM_REG_FRAME_LEN);
-    version = stream_ctrl_read(sdev, STREAM_REG_VERSION);
+    ctrl               = stream_ctrl_read(sdev, STREAM_REG_CTRL);
+    status             = stream_ctrl_read(sdev, STREAM_REG_STATUS);
+    packet_len         = stream_ctrl_read(sdev, STREAM_REG_PACKET_LEN);
+    rate_div           = stream_ctrl_read(sdev, STREAM_REG_RATE_DIV);
+    word_count         = stream_ctrl_read(sdev, STREAM_REG_WORD_COUNT);
+    packet_count       = stream_ctrl_read(sdev, STREAM_REG_PACKET_COUNT);
+    backpressure_count = stream_ctrl_read(sdev, STREAM_REG_BACKPRESSURE_COUNT);
+    version            = stream_ctrl_read(sdev, STREAM_REG_VERSION);
 
-    dev_info(sdev->dev, "stream_ctrl: CTRL      = 0x%08x\n", ctrl);
-    dev_info(sdev->dev, "stream_ctrl: STATUS    = 0x%08x\n", status);
-    dev_info(sdev->dev, "stream_ctrl: FRAME_LEN = 0x%08x\n", frame_len);
-    dev_info(sdev->dev, "stream_ctrl: VERSION   = 0x%08x\n", version);
+    dev_info(sdev->dev, "stream_ctrl: CTRL               = 0x%08x\n", ctrl);
+    dev_info(sdev->dev, "stream_ctrl: STATUS             = 0x%08x\n", status);
+    dev_info(sdev->dev, "stream_ctrl: PACKET_LEN         = 0x%08x\n", packet_len);
+    dev_info(sdev->dev, "stream_ctrl: RATE_DIV           = 0x%08x\n", rate_div);
+    dev_info(sdev->dev, "stream_ctrl: WORD_COUNT         = 0x%08x\n", word_count);
+    dev_info(sdev->dev, "stream_ctrl: PACKET_COUNT       = 0x%08x\n", packet_count);
+    dev_info(sdev->dev, "stream_ctrl: BACKPRESSURE_COUNT = 0x%08x\n", backpressure_count);
+    dev_info(sdev->dev, "stream_ctrl: VERSION            = 0x%08x\n", version);
 }
 
 static int stream_ctrl_probe(struct platform_device *pdev)
@@ -86,12 +98,12 @@ static int stream_ctrl_remove(struct platform_device *pdev)
 
 void stream_ctrl_hw_start(struct stream_ctrl_dev *sdev)
 {
-    stream_ctrl_write(sdev, STREAM_REG_CTRL, STREAM_CTRL_START);
+    stream_ctrl_write(sdev, STREAM_REG_CTRL, STREAM_CTRL_ENABLE);
 }
 
 void stream_ctrl_hw_stop(struct stream_ctrl_dev *sdev)
 {
-    stream_ctrl_write(sdev, STREAM_REG_CTRL, STREAM_CTRL_STOP);
+    stream_ctrl_write(sdev, STREAM_REG_CTRL, 0);
 }
 
 void stream_ctrl_hw_reset(struct stream_ctrl_dev *sdev)
