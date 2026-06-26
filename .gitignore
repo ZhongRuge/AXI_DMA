@@ -1,0 +1,10 @@
+# Vivado generated project files
+/Vivado_project/*
+
+# Keep HDL source files created in the Vivado project.
+!/Vivado_project/
+!/Vivado_project/Vivado_project.srcs/
+!/Vivado_project/Vivado_project.srcs/sources_1/
+Vivado_project/Vivado_project.srcs/sources_1/*
+!/Vivado_project/Vivado_project.srcs/sources_1/new/
+!/Vivado_project/Vivado_project.srcs/sources_1/new/**
