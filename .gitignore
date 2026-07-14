@@ -8,3 +8,22 @@
 Vivado_project/Vivado_project.srcs/sources_1/*
 !/Vivado_project/Vivado_project.srcs/sources_1/new/
 !/Vivado_project/Vivado_project.srcs/sources_1/new/**
+
+# Common Vivado generated artifacts for all project directories.
+**/.Xil/
+**/*.cache/
+**/*.gen/
+**/*.hw/
+**/*.ip_user_files/
+**/*.runs/
+**/*.sim/
+**/vivado*.jou
+**/vivado*.log
+**/*.xsa
+**/*.bit
+**/*.ltx
+
+# Block Design products regenerated from the checked-in .bd source.
+**/*.srcs/sources_1/bd/*/ip/
+**/*.srcs/sources_1/bd/*/ui/
+**/*.srcs/sources_1/bd/*/*.bda
