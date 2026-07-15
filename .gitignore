@@ -1,15 +1,9 @@
-# Vivado generated project files
-/Vivado_project/*
+# Legacy/reference projects are stored outside this repository
+/Navigator_7020/
+/Vivado_project/
 
-# Keep HDL source files created in the Vivado project.
-!/Vivado_project/
-!/Vivado_project/Vivado_project.srcs/
-!/Vivado_project/Vivado_project.srcs/sources_1/
-Vivado_project/Vivado_project.srcs/sources_1/*
-!/Vivado_project/Vivado_project.srcs/sources_1/new/
-!/Vivado_project/Vivado_project.srcs/sources_1/new/**
-
-# Common Vivado generated artifacts for all project directories.
+# Vivado generated directories
+/.Xil/
 **/.Xil/
 **/*.cache/
 **/*.gen/
@@ -17,13 +11,30 @@ Vivado_project/Vivado_project.srcs/sources_1/*
 **/*.ip_user_files/
 **/*.runs/
 **/*.sim/
-**/vivado*.jou
-**/vivado*.log
-**/*.xsa
-**/*.bit
-**/*.ltx
 
-# Block Design products regenerated from the checked-in .bd source.
+# Generated Block Design products
 **/*.srcs/sources_1/bd/*/ip/
 **/*.srcs/sources_1/bd/*/ui/
 **/*.srcs/sources_1/bd/*/*.bda
+
+# Vivado generated files and reports
+*.jou
+*.log
+*.str
+*.wdb
+*.pb
+*.dcp
+*.bit
+*.bin
+*.xsa
+*.hdf
+*.ltx
+*.rpt
+webtalk*
+usage_statistics_webtalk.*
+
+# Temporary/editor files
+*.tmp
+*.bak
+*~
+.vscode/
