@@ -1,8 +1,13 @@
 `timescale 1ns / 1ps
 
 module stream_gen (
-    input         s_axi_aclk,
-    input         s_axi_aresetn,
+    (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 s_axi_aclk CLK" *)
+    (* X_INTERFACE_PARAMETER = "XIL_INTERFACENAME s_axi_aclk, ASSOCIATED_BUSIF s_axi:m_axis, ASSOCIATED_RESET s_axi_aresetn, FREQ_HZ 100000000" *)
+    input s_axi_aclk,
+
+    (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 s_axi_aresetn RST" *)
+    (* X_INTERFACE_PARAMETER = "XIL_INTERFACENAME s_axi_aresetn, POLARITY ACTIVE_LOW" *)
+    input s_axi_aresetn,
 
     // AXI-Lite 写地址通道
     input  [4:0]  s_axi_awaddr,
