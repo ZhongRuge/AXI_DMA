@@ -4,7 +4,9 @@
 #include <linux/err.h>
 #include <linux/of.h>
 #include <linux/module.h>
+#include <linux/dmaengine.h>
 #include "stream_ctrl.h"
+
 
 static u32 stream_ctrl_read(struct stream_ctrl_dev *sdev, u32 reg)
 {
@@ -76,7 +78,21 @@ static int stream_ctrl_probe(struct platform_device *pdev)
 
     /* 绑定pdev和sdev 便于后续访问 */
     platform_set_drvdata(pdev, sdev);
-    dev_info(&pdev->dev, "stream_ctrl: ioremap success\n");
+
+    sdev->rx_chan = dma_request_chan(&pdev->dev, "rx");
+    if (IS_ERR(sdev->rx_chan)) {
+        int ret = PTR_ERR(sdev->rx_chan);
+
+        if (ret != -EPROBE_DEFER)
+            dev_err(&pdev->dev,
+                    "stream_ctrl: failed to request RX DMA channel: %d\n",
+                    ret);
+
+        return ret;
+    }
+
+    dev_info(&pdev->dev,
+            "stream_ctrl: DMA RX channel acquired successfully\n");
 
     stream_ctrl_dump_regs(sdev);
 
@@ -88,6 +104,11 @@ static int stream_ctrl_remove(struct platform_device *pdev)
     struct stream_ctrl_dev *sdev;
     sdev = platform_get_drvdata(pdev);
     dev_info(&pdev->dev, "stream_ctrl: remove called\n");
+
+    if (sdev && sdev->rx_chan) {
+        dma_release_channel(sdev->rx_chan);
+        sdev->rx_chan = NULL;
+    }
 
     if (sdev)
         dev_info(&pdev->dev, "stream_ctrl: resources will be released by devm\n");

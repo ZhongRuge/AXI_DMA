@@ -9,9 +9,7 @@
 
 #define STREAM_CTRL_DRV_NAME       "stream_ctrl"
 
-/* FIXME: bring-up placeholder, replace with real compatible after Week 2 */
-#define STREAM_CTRL_COMPATIBLE     "xlnx,PWM-2.0"
-#define STREAM_CTRL_COMPATIBLE_FUTURE "zrg,zynq-stream-axidma"
+#define STREAM_CTRL_COMPATIBLE     "zrg,zynq-stream-axidma"
 
 #define STREAM_REG_CTRL               0x00  /* Control register */
 #define STREAM_REG_STATUS             0x04  /* Status register */
@@ -29,10 +27,13 @@
 #define STREAM_STATUS_ERROR          BIT(1)  /* Error occurred */
 #define STREAM_STATUS_BACKPRESSURE   BIT(2)  /* Backpressure asserted */
 
+struct dma_chan;
+
 struct stream_ctrl_dev {
     struct device *dev;      /* Linux 设备对象 */
     void __iomem *base;      /* MMIO 虚拟基地址 */
     struct resource *res;    /* 物理地址资源 */
+    struct dma_chan *rx_chan;
 };
 
 void stream_ctrl_hw_start(struct stream_ctrl_dev *sdev);
