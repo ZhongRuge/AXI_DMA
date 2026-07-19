@@ -6,6 +6,8 @@
 #include <linux/device.h>
 #include <linux/ioport.h>
 #include <linux/bitops.h>
+#include <linux/dma-mapping.h>
+#include <linux/completion.h>
 
 #define STREAM_CTRL_DRV_NAME       "stream_ctrl"
 
@@ -27,13 +29,22 @@
 #define STREAM_STATUS_ERROR          BIT(1)  /* Error occurred */
 #define STREAM_STATUS_BACKPRESSURE   BIT(2)  /* Backpressure asserted */
 
+#define STREAM_RX_WORDS       16U
+#define STREAM_RX_BUF_SIZE    (STREAM_RX_WORDS * sizeof(u32))
+
 struct dma_chan;
 
 struct stream_ctrl_dev {
     struct device *dev;      /* Linux 设备对象 */
     void __iomem *base;      /* MMIO 虚拟基地址 */
     struct resource *res;    /* 物理地址资源 */
-    struct dma_chan *rx_chan;
+
+    struct dma_chan *rx_channel;
+
+    void *rx_buf;            /* CPU 访问 coherent buffer 使用的虚拟地址 */
+    dma_addr_t rx_dma_addr;  /* AXI DMA 访问该 buffer 使用的 DMA 地址 */
+    size_t rx_buf_size;      /* buffer 长度，单位：字节 */
+    struct completion rx_completion;
 };
 
 void stream_ctrl_hw_start(struct stream_ctrl_dev *sdev);

@@ -7,7 +7,6 @@
 #include <linux/dmaengine.h>
 #include "stream_ctrl.h"
 
-
 static u32 stream_ctrl_read(struct stream_ctrl_dev *sdev, u32 reg)
 {
     return readl(sdev->base + reg);
@@ -56,11 +55,13 @@ static int stream_ctrl_probe(struct platform_device *pdev)
 
     /* 创建并保存对象指针 */
     sdev = devm_kzalloc(&pdev->dev, sizeof(*sdev), GFP_KERNEL);
-    if (!sdev) 
+    if (!sdev)
         return -ENOMEM;
-    
+
     sdev->dev = &pdev->dev;
-    
+
+    init_completion(&sdev->rx_completion);
+
     /* 获取 绑定 映射 物理资源 */
     res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
     if (!res) {
@@ -79,9 +80,9 @@ static int stream_ctrl_probe(struct platform_device *pdev)
     /* 绑定pdev和sdev 便于后续访问 */
     platform_set_drvdata(pdev, sdev);
 
-    sdev->rx_chan = dma_request_chan(&pdev->dev, "rx");
-    if (IS_ERR(sdev->rx_chan)) {
-        int ret = PTR_ERR(sdev->rx_chan);
+    sdev->rx_channel = dma_request_chan(&pdev->dev, "rx");
+    if (IS_ERR(sdev->rx_channel)) {
+        int ret = PTR_ERR(sdev->rx_channel);
 
         if (ret != -EPROBE_DEFER)
             dev_err(&pdev->dev,
@@ -91,8 +92,20 @@ static int stream_ctrl_probe(struct platform_device *pdev)
         return ret;
     }
 
+    sdev->rx_buf_size = STREAM_RX_BUF_SIZE;
+    sdev->rx_buf = dma_alloc_coherent(sdev->dev,
+                                       sdev->rx_buf_size,
+                                       &sdev->rx_dma_addr,
+                                       GFP_KERNEL);
+    if (sdev->rx_buf == NULL) {
+        dma_release_channel(sdev->rx_channel);
+        sdev->rx_channel = NULL;
+        return -ENOMEM;
+    }
+
     dev_info(&pdev->dev,
-            "stream_ctrl: DMA RX channel acquired successfully\n");
+            "stream_ctrl: DMA RX buffer allocated, size=%zu, dma=%pad\n",
+            sdev->rx_buf_size, &sdev->rx_dma_addr);
 
     stream_ctrl_dump_regs(sdev);
 
@@ -105,9 +118,19 @@ static int stream_ctrl_remove(struct platform_device *pdev)
     sdev = platform_get_drvdata(pdev);
     dev_info(&pdev->dev, "stream_ctrl: remove called\n");
 
-    if (sdev && sdev->rx_chan) {
-        dma_release_channel(sdev->rx_chan);
-        sdev->rx_chan = NULL;
+    if (sdev && sdev->rx_buf) {
+        dma_free_coherent(sdev->dev,
+                          sdev->rx_buf_size,
+                          sdev->rx_buf,
+                          sdev->rx_dma_addr);
+        sdev->rx_buf = NULL;
+        sdev->rx_dma_addr = 0;
+        sdev->rx_buf_size = 0;
+    }
+
+    if (sdev && sdev->rx_channel) {
+        dma_release_channel(sdev->rx_channel);
+        sdev->rx_channel = NULL;
     }
 
     if (sdev)
