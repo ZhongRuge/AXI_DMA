@@ -1,10 +1,10 @@
+#include <linux/dmaengine.h>
+#include <linux/err.h>
+#include <linux/errno.h>
+#include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
-#include <linux/errno.h>
-#include <linux/err.h>
-#include <linux/of.h>
-#include <linux/module.h>
-#include <linux/dmaengine.h>
 #include "stream_ctrl.h"
 
 static u32 stream_ctrl_read(struct stream_ctrl_dev *sdev, u32 reg)
@@ -17,7 +17,62 @@ static void stream_ctrl_write(struct stream_ctrl_dev *sdev, u32 reg, u32 value)
     writel(value, sdev->base + reg);
 }
 
-/* 从 MMIO 基地址读取 8 个寄存器并打印 */
+/* DMAEngine 完成回调：只通知等待路径，不执行耗时操作 */
+static void stream_ctrl_dma_callback(void *args)
+{
+    struct stream_ctrl_dev *sdev = args;
+
+    complete(&sdev->rx_completion);
+}
+
+/* 准备一次 RX 单次传输 descriptor */
+static struct dma_async_tx_descriptor *
+prepare_descriptor(struct stream_ctrl_dev *sdev)
+{
+    struct dma_async_tx_descriptor *descriptor;
+    unsigned long flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
+
+    descriptor = dmaengine_prep_slave_single(sdev->rx_channel,
+                                              sdev->rx_dma_addr,
+                                              sdev->rx_buf_size,
+                                              DMA_DEV_TO_MEM,
+                                              flags);
+    if (!descriptor) {
+        return NULL;
+    }
+
+    /* 绑定 DMA 完成回调及其设备上下文 */
+    descriptor->callback = stream_ctrl_dma_callback;
+    descriptor->callback_param = sdev;
+
+    return descriptor;
+}
+
+/* 提交 RX descriptor，并推送 channel 的 pending 队列 */
+static int submit_assist(struct stream_ctrl_dev *sdev,
+                         dma_cookie_t *cookie_out)
+{
+    struct dma_async_tx_descriptor *descriptor;
+    dma_cookie_t temp_cookie;
+
+    descriptor = prepare_descriptor(sdev);
+    if (!descriptor) {
+        return -ENOMEM;
+    }
+
+    temp_cookie = dmaengine_submit(descriptor);
+    if (dma_submit_error(temp_cookie)) {
+        return dma_submit_error(temp_cookie);
+    }
+
+    *cookie_out = temp_cookie;
+
+    dma_async_issue_pending(sdev->rx_channel);
+
+    return 0;
+}
+
+/* 读取并打印 stream_gen 的寄存器 */
 static void stream_ctrl_dump_regs(struct stream_ctrl_dev *sdev)
 {
     u32 ctrl;
@@ -53,7 +108,7 @@ static int stream_ctrl_probe(struct platform_device *pdev)
     struct stream_ctrl_dev *sdev;
     struct resource *res;
 
-    /* 创建并保存对象指针 */
+    /* 创建并保存设备私有对象 */
     sdev = devm_kzalloc(&pdev->dev, sizeof(*sdev), GFP_KERNEL);
     if (!sdev)
         return -ENOMEM;
@@ -62,7 +117,7 @@ static int stream_ctrl_probe(struct platform_device *pdev)
 
     init_completion(&sdev->rx_completion);
 
-    /* 获取 绑定 映射 物理资源 */
+    /* 获取并映射 MMIO 资源 */
     res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
     if (!res) {
         dev_err(&pdev->dev, "stream_ctrl: failed to get MEM resource\n");
@@ -77,7 +132,7 @@ static int stream_ctrl_probe(struct platform_device *pdev)
         return PTR_ERR(sdev->base);
     }
 
-    /* 绑定pdev和sdev 便于后续访问 */
+    /* 绑定 pdev 和 sdev，便于后续访问 */
     platform_set_drvdata(pdev, sdev);
 
     sdev->rx_channel = dma_request_chan(&pdev->dev, "rx");
@@ -104,8 +159,8 @@ static int stream_ctrl_probe(struct platform_device *pdev)
     }
 
     dev_info(&pdev->dev,
-            "stream_ctrl: DMA RX buffer allocated, size=%zu, dma=%pad\n",
-            sdev->rx_buf_size, &sdev->rx_dma_addr);
+             "stream_ctrl: DMA RX buffer allocated, size=%zu, dma=%pad\n",
+             sdev->rx_buf_size, &sdev->rx_dma_addr);
 
     stream_ctrl_dump_regs(sdev);
 
@@ -118,6 +173,7 @@ static int stream_ctrl_remove(struct platform_device *pdev)
     sdev = platform_get_drvdata(pdev);
     dev_info(&pdev->dev, "stream_ctrl: remove called\n");
 
+    /* coherent buffer 必须先于 DMA channel 释放 */
     if (sdev && sdev->rx_buf) {
         dma_free_coherent(sdev->dev,
                           sdev->rx_buf_size,
@@ -141,16 +197,19 @@ static int stream_ctrl_remove(struct platform_device *pdev)
 
 void stream_ctrl_hw_start(struct stream_ctrl_dev *sdev)
 {
+    /* 启动 stream_gen 数据输出 */
     stream_ctrl_write(sdev, STREAM_REG_CTRL, STREAM_CTRL_ENABLE);
 }
 
 void stream_ctrl_hw_stop(struct stream_ctrl_dev *sdev)
 {
+    /* 停止 stream_gen 数据输出 */
     stream_ctrl_write(sdev, STREAM_REG_CTRL, 0);
 }
 
 void stream_ctrl_hw_reset(struct stream_ctrl_dev *sdev)
 {
+    /* 触发 stream_gen 单周期软件复位 */
     stream_ctrl_write(sdev, STREAM_REG_CTRL, STREAM_CTRL_RESET);
 }
 
