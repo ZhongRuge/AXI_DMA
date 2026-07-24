@@ -50,7 +50,7 @@ static void stream_ctrl_prepare_rx(struct stream_ctrl_dev *sdev)
 
     /* 使用一个包含 16 个 word 的数据包，不设置额外的数据间隔。 */
     stream_ctrl_write(sdev, STREAM_REG_PACKET_LEN, STREAM_RX_WORDS);
-    stream_ctrl_write(sdev, STREAM_REG_RATE_DIV, 0);
+    stream_ctrl_write(sdev, STREAM_REG_RATE_DIV, 1000);
 
     /* 成功传输后，这个标记应被 0、1、...、15 完整覆盖。 */
     memset(sdev->rx_buf, 0xA5, sdev->rx_buf_size);
@@ -385,12 +385,20 @@ static int stream_ctrl_remove(struct platform_device *pdev)
     sdev = platform_get_drvdata(pdev);
     dev_info(&pdev->dev, "stream_ctrl: remove called\n");
 
+    if (sdev) {
+        stream_ctrl_hw_stop(sdev);
+    }
+
     /*
      * 终止 pending 或 active 状态的传输，并等待 callback 结束，然后才能
      * 释放 callback 或 DMAEngine 可能仍然访问的内存。
      */
     if (sdev && sdev->rx_channel) {
         dmaengine_terminate_sync(sdev->rx_channel);
+    }
+
+    if (sdev) {
+        stream_ctrl_hw_reset(sdev);
     }
 
     /* 只有 DMA 不再访问 buffer 后，才能释放 coherent 内存。 */
