@@ -67,6 +67,10 @@ reg [31:0] packet_count_reg;       // 已成功输出的数据包总数
 reg [31:0] backpressure_count_reg; // 因 tready 拉低而阻塞的时钟周期数
 reg        stream_reset_reg;       // 通知 AXI-Stream 逻辑执行一次软件复位
 
+reg        stream_start_reg;       // 软件写 ENABLE 时产生的单周期启动脉冲
+reg        stream_done_reg;        // 最后一个数据完成握手时产生的单周期完成脉冲
+reg        stream_active_reg;      // 当前是否正在发送一个数据包
+
 // AXI-Lite 写通道
 reg       s_axi_awready_reg;
 reg       s_axi_wready_reg;
@@ -118,6 +122,7 @@ always @(posedge s_axi_aclk) begin
         packet_len_reg   <= 32'd16;
         rate_div_reg     <= 32'd0;
         stream_reset_reg <= 1'b0;
+        stream_start_reg <= 1'b0;
 
         s_axi_awready_reg <= 1'b0;
         s_axi_wready_reg  <= 1'b0;
@@ -133,6 +138,15 @@ always @(posedge s_axi_aclk) begin
     else begin
         // 软件复位请求默认只保持一个时钟周期
         stream_reset_reg <= 1'b0;
+        stream_start_reg <= 1'b0;
+
+        /*
+        * 一个包发送完成后自动清除 CTRL.ENABLE。
+        * ctrl_reg 只在这个 AXI-Lite always 块中赋值，避免多驱动。
+        */
+        if (stream_done_reg) begin
+            ctrl_reg <= 32'd0;
+        end
 
         // AW 写地址接收就绪控制
         if (!s_axi_awvalid_reg && !s_axi_bvalid_reg) begin
@@ -194,7 +208,14 @@ always @(posedge s_axi_aclk) begin
                             stream_reset_reg <= 1'b1;
                         end
                         else begin
+                            /*
+                            * bit0 保存为 ENABLE 的软件可见状态。
+                            * 写 1 时额外产生一个单周期启动脉冲。
+                            */
                             ctrl_reg <= {31'd0, s_axi_wdata_reg[0]};
+                            if (s_axi_wdata_reg[0]) begin
+                                stream_start_reg <= 1'b1;
+                            end
                         end
                     end
 
@@ -281,7 +302,7 @@ always @(posedge s_axi_aclk) begin
     end
 end
 
-// AXI-Stream 递增数据输出
+// AXI-Stream 单包递增数据输出
 always @(posedge s_axi_aclk) begin
     if (!s_axi_aresetn || stream_reset_reg) begin
         seq_counter_reg        <= 32'd0;
@@ -291,49 +312,57 @@ always @(posedge s_axi_aclk) begin
         packet_count_reg       <= 32'd0;
         backpressure_count_reg <= 32'd0;
         status_reg             <= 32'd0;
+
         m_axis_tdata_reg       <= 32'd0;
         m_axis_tvalid_reg      <= 1'b0;
         m_axis_tlast_reg       <= 1'b0;
+
+        stream_done_reg        <= 1'b0;
+        stream_active_reg      <= 1'b0;
     end
     else begin
-        // 状态寄存器：运行、错误、当前背压状态
+        /*
+         * 完成通知只保持一个时钟周期。
+         * 在最后一个数据成功握手时，后面的逻辑会重新将其置 1。
+         */
+        stream_done_reg <= 1'b0;
+
+        /*
+         * STATUS：
+         * bit0：单包正在发送
+         * bit1：保留为错误标志，目前固定为 0
+         * bit2：当前受到背压
+         */
         status_reg <= {
             29'd0,
             m_axis_tvalid_reg && !m_axis_tready,
             1'b0,
-            ctrl_reg[0]
+            stream_active_reg
         };
 
-        // 每持续一个背压周期，累计计数增加一次
+        // TVALID 已经拉高但 DMA 未接收时，累计背压周期
         if (m_axis_tvalid_reg && !m_axis_tready) begin
             backpressure_count_reg <= backpressure_count_reg + 1'b1;
         end
 
-        // 握手成功后推进计数器，并准备下一个数据
-        if (m_axis_tvalid_reg && m_axis_tready) begin
-            seq_counter_reg   <= seq_counter_reg + 1'b1;
-            word_count_reg    <= word_count_reg + 1'b1;
-            m_axis_tdata_reg  <= seq_counter_reg + 1'b1;
+        /*
+         * 当前没有正在发送的数据包。
+         * 只有收到 stream_start_reg 单周期脉冲才启动新包。
+         */
+        if (!stream_active_reg) begin
+            rate_count_reg    <= 32'd0;
+            m_axis_tvalid_reg <= 1'b0;
+            m_axis_tlast_reg  <= 1'b0;
 
-            // 禁用时完成当前握手后停止，不再提出下一份有效数据
-            if (!ctrl_reg[0]) begin
-                rate_count_reg    <= 32'd0;
-                m_axis_tvalid_reg <= 1'b0;
-            end
-            // RATE_DIV 为 N 时，在本次传输后等待 N 个时钟周期
-            else if (rate_div_reg == 32'd0) begin
-                m_axis_tvalid_reg <= 1'b1;
-            end
-            else begin
-                rate_count_reg    <= rate_div_reg;
-                m_axis_tvalid_reg <= 1'b0;
-            end
-
-            // 当前包结束后，下一份数据从新包下标 0 开始
-            if (m_axis_tlast_reg) begin
+            if (stream_start_reg) begin
+                stream_active_reg     <= 1'b1;
                 packet_word_index_reg <= 32'd0;
-                packet_count_reg      <= packet_count_reg + 1'b1;
 
+                // 软件复位后 seq_counter_reg 为 0，因此第一个数据为 0
+                m_axis_tdata_reg  <= seq_counter_reg;
+                m_axis_tvalid_reg <= 1'b1;
+
+                // 单 word 数据包的第一个数据同时也是最后一个数据
                 if (packet_len_reg == 32'd1) begin
                     m_axis_tlast_reg <= 1'b1;
                 end
@@ -341,26 +370,95 @@ always @(posedge s_axi_aclk) begin
                     m_axis_tlast_reg <= 1'b0;
                 end
             end
+        end
+
+        /*
+         * 当前数据成功握手。
+         * 只有 TVALID 和 TREADY 同时为 1，数据和包内下标才能推进。
+         */
+        else if (m_axis_tvalid_reg && m_axis_tready) begin
+            seq_counter_reg <= seq_counter_reg + 1'b1;
+            word_count_reg  <= word_count_reg + 1'b1;
+
+            /*
+             * 当前传输的是最后一个 word。
+             * 必须在 TLAST 成功握手后才结束数据包。
+             */
+            if (m_axis_tlast_reg) begin
+                packet_count_reg      <= packet_count_reg + 1'b1;
+                packet_word_index_reg <= 32'd0;
+                rate_count_reg        <= 32'd0;
+
+                m_axis_tvalid_reg <= 1'b0;
+                m_axis_tlast_reg  <= 1'b0;
+
+                stream_active_reg <= 1'b0;
+                stream_done_reg   <= 1'b1;
+            end
+
+            /*
+             * 软件在数据包中途写 CTRL=0。
+             * 当前已提出的数据完成握手后停止，避免违反 AXI-Stream 协议。
+             */
+            else if (!ctrl_reg[0]) begin
+                packet_word_index_reg <= 32'd0;
+                rate_count_reg        <= 32'd0;
+
+                m_axis_tvalid_reg <= 1'b0;
+                m_axis_tlast_reg  <= 1'b0;
+                stream_active_reg <= 1'b0;
+            end
+
+            /*
+             * 当前 word 不是最后一个，准备下一个 word。
+             */
             else begin
                 packet_word_index_reg <= packet_word_index_reg + 1'b1;
+                m_axis_tdata_reg      <= seq_counter_reg + 1'b1;
 
-                if (packet_word_index_reg + 1'b1 == packet_len_reg - 1'b1) begin
+                /*
+                 * 当前 index 为 N，刚完成 N 的握手；
+                 * 下一份数据的 index 是 N+1。
+                 */
+                if (packet_word_index_reg + 1'b1 ==
+                    packet_len_reg - 1'b1) begin
                     m_axis_tlast_reg <= 1'b1;
                 end
                 else begin
                     m_axis_tlast_reg <= 1'b0;
                 end
+
+                /*
+                 * RATE_DIV=0：保持 TVALID，下一周期可继续握手。
+                 * 这是后续高速测试需要的无气泡模式。
+                 */
+                if (rate_div_reg == 32'd0) begin
+                    rate_count_reg    <= 32'd0;
+                    m_axis_tvalid_reg <= 1'b1;
+                end
+                else begin
+                    rate_count_reg    <= rate_div_reg;
+                    m_axis_tvalid_reg <= 1'b0;
+                end
             end
         end
-        // 禁用时不再产生新数据；已提出的数据保持到握手完成
-        else if (!ctrl_reg[0]) begin
-            rate_count_reg <= 32'd0;
-        end
-        // 节流等待期间不输出有效数据
-        else if (rate_count_reg != 32'd0) begin
-            m_axis_tvalid_reg <= 1'b0;
 
-            // 倒计时结束后，恢复已经准备好的下一份数据
+        /*
+         * 节流等待期间，如果软件写 CTRL=0，可以立即结束。
+         * 此时 TVALID=0，没有尚未完成的 AXI-Stream 传输。
+         */
+        else if (!m_axis_tvalid_reg && !ctrl_reg[0]) begin
+            packet_word_index_reg <= 32'd0;
+            rate_count_reg        <= 32'd0;
+            m_axis_tlast_reg      <= 1'b0;
+            stream_active_reg     <= 1'b0;
+        end
+
+        /*
+         * RATE_DIV 节流倒计时。
+         * TDATA 和 TLAST 已经提前准备完成，在等待期间保持不变。
+         */
+        else if (!m_axis_tvalid_reg && rate_count_reg != 32'd0) begin
             if (rate_count_reg == 32'd1) begin
                 rate_count_reg    <= 32'd0;
                 m_axis_tvalid_reg <= 1'b1;
@@ -369,18 +467,12 @@ always @(posedge s_axi_aclk) begin
                 rate_count_reg <= rate_count_reg - 1'b1;
             end
         end
-        // 当前没有有效数据时，准备第一个数据
-        else if (!m_axis_tvalid_reg) begin
-            m_axis_tdata_reg  <= seq_counter_reg;
-            m_axis_tvalid_reg <= 1'b1;
 
-            if (packet_word_index_reg == packet_len_reg - 1'b1) begin
-                m_axis_tlast_reg <= 1'b1;
-            end
-            else begin
-                m_axis_tlast_reg <= 1'b0;
-            end
-        end
+        /*
+         * 其他情况主要是：
+         * TVALID=1、TREADY=0。
+         * 此时不赋值，自动保持 TDATA、TVALID、TLAST 不变。
+         */
     end
 end
 

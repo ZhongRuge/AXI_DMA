@@ -70,6 +70,7 @@ static void stream_ctrl_dma_callback(void *args)
 {
     struct stream_ctrl_dev *sdev = args;
 
+    stream_ctrl_hw_stop(sdev);
     complete(&sdev->rx_completion);
 }
 
@@ -195,6 +196,23 @@ static int stream_ctrl_receive_once(struct stream_ctrl_dev *sdev)
         dmaengine_terminate_sync(sdev->rx_channel);
         return -EIO;
     }
+
+    /*
+     * 当前应用是一次性单包接收。复位 S2MM 通道，
+     * 清除 DMA 内部可能缓存的下一包部分数据。
+     */
+    ret = dmaengine_terminate_sync(sdev->rx_channel);
+    if (ret) {
+        dev_err(sdev->dev,
+                "failed to reset RX DMA channel: %d\n",
+                ret);
+        return ret;
+    }
+    
+    dev_info(sdev->dev,
+         "RX counters after stop: words=%u, packets=%u\n",
+         stream_ctrl_read(sdev, STREAM_REG_WORD_COUNT),
+         stream_ctrl_read(sdev, STREAM_REG_PACKET_COUNT));
 
     return 0;
 }
@@ -351,6 +369,13 @@ static int stream_ctrl_probe(struct platform_device *pdev)
     ret = stream_ctrl_receive_once(sdev);
     if (!ret)
         ret = stream_ctrl_validate_rx(sdev);
+
+    if (!ret) {
+        dev_info(sdev->dev, "stream_ctrl: starting second rx transfer.\n");
+        ret = stream_ctrl_receive_once(sdev);
+        if (!ret)
+            ret = stream_ctrl_validate_rx(sdev);
+    }
 
     if (ret) {
         dev_err(sdev->dev,
