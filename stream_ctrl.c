@@ -7,8 +7,12 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/fs.h>
 
 #include "stream_ctrl.h"
+
+static dev_t stream_dev_num;
+static struct class *stream_class;
 
 static u32 stream_ctrl_read(struct stream_ctrl_dev *sdev, u32 reg)
 {
@@ -302,6 +306,35 @@ static void stream_ctrl_dump_regs(struct stream_ctrl_dev *sdev)
     dev_info(sdev->dev, "stream_ctrl: VERSION            = 0x%08x\n", version);
 }
 
+static int stream_ctrl_open(struct inode *inode, struct file* filp)
+{
+    struct stream_ctrl_dev *sdev;
+    sdev = container_of(inode->i_cdev, struct stream_ctrl_dev, cdev);
+    filp->private_data = sdev;
+    return 0;
+}
+
+static int stream_ctrl_release(struct inode *inode, struct file *filp)
+{
+    return 0;
+}
+
+static ssize_t stream_ctrl_file_read(struct file *filp, char __user *buf,
+                                     size_t count, loff_t *ppos)
+{
+    if (count == 0) return 0;
+    if (count < STREAM_RX_BUF_SIZE) return -EMSGSIZE;
+    return -EOPNOTSUPP;
+}
+
+static struct file_operations stream_ctrl_fops = {
+    .owner = THIS_MODULE,
+    .open = stream_ctrl_open,
+    .release = stream_ctrl_release,
+    .read = stream_ctrl_file_read,
+    .llseek = no_llseek
+};
+
 static int stream_ctrl_probe(struct platform_device *pdev)
 {
     struct stream_ctrl_dev *sdev;
@@ -382,25 +415,44 @@ static int stream_ctrl_probe(struct platform_device *pdev)
                 "stream_ctrl: RX transfer failed: %d\n",
                 ret);
         stream_ctrl_dump_regs(sdev);
+        goto err_free_dma;
+    }
 
-        dma_free_coherent(sdev->dev,
-                          sdev->rx_buf_size,
-                          sdev->rx_buf,
-                          sdev->rx_dma_addr);
-        sdev->rx_buf = NULL;
-        sdev->rx_dma_addr = 0;
-        sdev->rx_buf_size = 0;
+    cdev_init(&sdev->cdev, &stream_ctrl_fops);
+    sdev->cdev.owner = THIS_MODULE;
+    ret = cdev_add(&sdev->cdev, stream_dev_num, 1);
+    if (ret) {
+        dev_err(&pdev->dev, "cdev_add failed: %d\n", ret);
+        goto err_free_dma;
+    }
 
-        dma_release_channel(sdev->rx_channel);
-        sdev->rx_channel = NULL;
-
-        return ret;
+    sdev->dev_node = device_create(stream_class, &pdev->dev, stream_dev_num, sdev, "zynq_stream0");
+    if (IS_ERR(sdev->dev_node)) {
+        ret = PTR_ERR(sdev->dev_node);
+        dev_err(&pdev->dev, "device_create failed: %d\n", ret);
+        goto err_cdev_del;
     }
 
     /* 一次性 RX 传输成功后，读取并打印 stream_gen 寄存器。 */
     stream_ctrl_dump_regs(sdev);
 
     return 0;
+
+err_cdev_del:
+    cdev_del(&sdev->cdev);
+err_free_dma:
+    dma_free_coherent(sdev->dev,
+                      sdev->rx_buf_size,
+                      sdev->rx_buf,
+                      sdev->rx_dma_addr);
+    sdev->rx_buf = NULL;
+    sdev->rx_dma_addr = 0;
+    sdev->rx_buf_size = 0;
+
+    dma_release_channel(sdev->rx_channel);
+    sdev->rx_channel = NULL;
+
+    return ret;
 }
 
 static int stream_ctrl_remove(struct platform_device *pdev)
@@ -411,8 +463,11 @@ static int stream_ctrl_remove(struct platform_device *pdev)
     dev_info(&pdev->dev, "stream_ctrl: remove called\n");
 
     if (sdev) {
+        cdev_del(&sdev->cdev);
         stream_ctrl_hw_stop(sdev);
     }
+
+    device_destroy(stream_class, stream_dev_num);
 
     /*
      * 终止 pending 或 active 状态的传输，并等待 callback 结束，然后才能
@@ -491,7 +546,45 @@ static struct platform_driver stream_ctrl_driver = {
     }
 };
 
-module_platform_driver(stream_ctrl_driver);
+static int __init stream_ctrl_init(void)
+{
+    int ret;
+
+    ret = alloc_chrdev_region(&stream_dev_num, 0, 1, "zynq_stream");
+    if (ret) {
+        pr_err("alloc_chrdev_region failed: ret=%d\n", ret);
+        return ret;
+    }
+
+    pr_info("major:%u, minor:%u\n", MAJOR(stream_dev_num), MINOR(stream_dev_num));
+
+    stream_class = class_create(THIS_MODULE, "zynq_stream");
+    if (IS_ERR(stream_class)) {
+        ret = PTR_ERR(stream_class);
+        pr_err("class_create failed: ret=%d\n", ret);
+        unregister_chrdev_region(stream_dev_num, 1);
+        return ret;
+    }
+
+    ret = platform_driver_register(&stream_ctrl_driver);
+    if (ret) {
+        pr_err("platform_driver_register failed: ret=%d\n", ret);
+        class_destroy(stream_class);
+        unregister_chrdev_region(stream_dev_num, 1);
+        return ret;
+    }
+    return 0;
+}
+
+static void __exit stream_ctrl_exit(void)
+{
+    platform_driver_unregister(&stream_ctrl_driver);
+    class_destroy(stream_class);
+    unregister_chrdev_region(stream_dev_num, 1);
+}
+
+module_init(stream_ctrl_init);
+module_exit(stream_ctrl_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("ZRG");

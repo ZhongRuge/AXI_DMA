@@ -8,6 +8,7 @@
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/types.h>
+#include <linux/cdev.h>
 
 #define STREAM_CTRL_DRV_NAME       "stream_ctrl"
 
@@ -45,6 +46,9 @@ struct stream_ctrl_dev {
     dma_addr_t rx_dma_addr;  /* DMA 访问 buffer 的地址 */
     size_t rx_buf_size;      /* buffer 长度，单位：字节 */
     struct completion rx_completion; /* DMA 完成通知 */
+
+    struct cdev cdev;         /* 字符设备对象（5.1b 由 cdev_init/cdev_add 初始化） */
+    struct device *dev_node;  /* device_create() 返回的设备节点指针 */
 };
 
 void stream_ctrl_hw_start(struct stream_ctrl_dev *sdev);
