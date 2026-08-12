@@ -9,6 +9,7 @@
 #include <linux/ioport.h>
 #include <linux/types.h>
 #include <linux/cdev.h>
+#include <linux/mutex.h>
 
 #define STREAM_CTRL_DRV_NAME       "stream_ctrl"
 
@@ -49,6 +50,8 @@ struct stream_ctrl_dev {
 
     struct cdev cdev;         /* 字符设备对象（5.1b 由 cdev_init/cdev_add 初始化） */
     struct device *dev_node;  /* device_create() 返回的设备节点指针 */
+
+    struct mutex io_lock;
 };
 
 void stream_ctrl_hw_start(struct stream_ctrl_dev *sdev);

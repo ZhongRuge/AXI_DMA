@@ -8,6 +8,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/fs.h>
+#include <linux/uaccess.h>
 
 #include "stream_ctrl.h"
 
@@ -202,8 +203,9 @@ static int stream_ctrl_receive_once(struct stream_ctrl_dev *sdev)
     }
 
     /*
-     * 当前应用是一次性单包接收。复位 S2MM 通道，
-     * 清除 DMA 内部可能缓存的下一包部分数据。
+     * 正常完成后的 terminate 为 Week 4 遗留的防御性清理。
+     * 当前 RTL 一次启动只发送一包，其必要性尚未确认；
+     * 暂时保留，待板端 A/B 测试后决定是否删除。
      */
     ret = dmaengine_terminate_sync(sdev->rx_channel);
     if (ret) {
@@ -213,64 +215,10 @@ static int stream_ctrl_receive_once(struct stream_ctrl_dev *sdev)
         return ret;
     }
     
-    dev_info(sdev->dev,
-         "RX counters after stop: words=%u, packets=%u\n",
-         stream_ctrl_read(sdev, STREAM_REG_WORD_COUNT),
-         stream_ctrl_read(sdev, STREAM_REG_PACKET_COUNT));
-
-    return 0;
-}
-
-/*
- * 在进程上下文中校验一次 RX buffer 的内容。
- *
- * stream_gen.v 已经确认：复位后第一个数据为 0，之后每个数据递增 1。
- * 当前 PACKET_LEN 为 16，因此这里期望 buffer 中依次出现 0 到 15。
- *
- * 这个函数故意不逐个打印所有 word，只记录第一个错误的位置、期望值、
- * 实际值和总错误数。这样既能定位问题，也不会让内核日志被大量输出占满。
- * DMA buffer 来自 dma_alloc_coherent()，DMA 完成后 CPU 可以直接通过这个
- * 虚拟地址读取内容。
- */
-static int stream_ctrl_validate_rx(struct stream_ctrl_dev *sdev)
-{
-    u32 *data = sdev->rx_buf;
-    u32 first_expected = 0;
-    u32 first_actual = 0;
-    unsigned int error_count = 0;
-    unsigned int i;
-    int first_error = -1;
-
-    for (i = 0; i < STREAM_RX_WORDS; i++) {
-        u32 expected = i;
-        u32 actual = data[i];
-
-        if (actual == expected)
-            continue;
-
-        if (first_error < 0) {
-            first_error = i;
-            first_expected = expected;
-            first_actual = actual;
-        }
-
-        error_count++;
-    }
-
-    if (error_count) {
-        dev_err(sdev->dev,
-                "RX data validation failed: first index=%d, "
-                "expected=0x%08x, actual=0x%08x, errors=%u\n",
-                first_error,
-                first_expected,
-                first_actual,
-                error_count);
-        return -EIO;
-    }
-
-    dev_info(sdev->dev,
-             "RX data validation passed: words=%u\n",
-             STREAM_RX_WORDS);
+    dev_dbg(sdev->dev,
+        "RX counters after stop: words=%u, packets=%u\n",
+        stream_ctrl_read(sdev, STREAM_REG_WORD_COUNT),
+        stream_ctrl_read(sdev, STREAM_REG_PACKET_COUNT));
 
     return 0;
 }
@@ -311,7 +259,7 @@ static int stream_ctrl_open(struct inode *inode, struct file* filp)
     struct stream_ctrl_dev *sdev;
     sdev = container_of(inode->i_cdev, struct stream_ctrl_dev, cdev);
     filp->private_data = sdev;
-    return 0;
+    return nonseekable_open(inode, filp);
 }
 
 static int stream_ctrl_release(struct inode *inode, struct file *filp)
@@ -322,9 +270,29 @@ static int stream_ctrl_release(struct inode *inode, struct file *filp)
 static ssize_t stream_ctrl_file_read(struct file *filp, char __user *buf,
                                      size_t count, loff_t *ppos)
 {
+    int ret;
+    struct stream_ctrl_dev *sdev;
+    sdev = filp->private_data;
+
     if (count == 0) return 0;
     if (count < STREAM_RX_BUF_SIZE) return -EMSGSIZE;
-    return -EOPNOTSUPP;
+
+    mutex_lock(&sdev->io_lock);
+
+    ret = stream_ctrl_receive_once(sdev);
+    if (ret) {
+        stream_ctrl_dump_regs(sdev);
+        goto out_unlock;
+    }
+
+    if (copy_to_user(buf, sdev->rx_buf, STREAM_RX_BUF_SIZE))
+        ret = -EFAULT;
+    else
+        ret = STREAM_RX_BUF_SIZE;
+    
+out_unlock:
+    mutex_unlock(&sdev->io_lock);
+    return ret;
 }
 
 static struct file_operations stream_ctrl_fops = {
@@ -350,6 +318,8 @@ static int stream_ctrl_probe(struct platform_device *pdev)
 
     /* probe 时初始化一次；之后每次传输使用 reinit_completion()。 */
     init_completion(&sdev->rx_completion);
+    
+    mutex_init(&sdev->io_lock);
 
     /* 获取并映射 stream_gen 的 MMIO 资源。 */
     res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -399,25 +369,6 @@ static int stream_ctrl_probe(struct platform_device *pdev)
              "stream_ctrl: DMA RX buffer allocated, size=%zu, dma=%pad\n",
              sdev->rx_buf_size, &sdev->rx_dma_addr);
 
-    ret = stream_ctrl_receive_once(sdev);
-    if (!ret)
-        ret = stream_ctrl_validate_rx(sdev);
-
-    if (!ret) {
-        dev_info(sdev->dev, "stream_ctrl: starting second rx transfer.\n");
-        ret = stream_ctrl_receive_once(sdev);
-        if (!ret)
-            ret = stream_ctrl_validate_rx(sdev);
-    }
-
-    if (ret) {
-        dev_err(sdev->dev,
-                "stream_ctrl: RX transfer failed: %d\n",
-                ret);
-        stream_ctrl_dump_regs(sdev);
-        goto err_free_dma;
-    }
-
     cdev_init(&sdev->cdev, &stream_ctrl_fops);
     sdev->cdev.owner = THIS_MODULE;
     ret = cdev_add(&sdev->cdev, stream_dev_num, 1);
@@ -433,7 +384,6 @@ static int stream_ctrl_probe(struct platform_device *pdev)
         goto err_cdev_del;
     }
 
-    /* 一次性 RX 传输成功后，读取并打印 stream_gen 寄存器。 */
     stream_ctrl_dump_regs(sdev);
 
     return 0;
