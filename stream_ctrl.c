@@ -15,6 +15,7 @@
 static dev_t stream_dev_num;
 static struct class *stream_class;
 
+
 static u32 stream_ctrl_read(struct stream_ctrl_dev *sdev, u32 reg)
 {
     return readl(sdev->base + reg);
@@ -35,7 +36,7 @@ static void stream_ctrl_write(struct stream_ctrl_dev *sdev, u32 reg, u32 value)
  *   2. 复位 RTL 中的数据序列、计数器和状态；
  *   3. 配置数据包长度和输出速率；
  *   4. 用标记值填充 buffer，便于发现 DMA 未完整写入；
- *   5. 在提交 descriptor 前重新准备 completion。
+ *   5. 为本次接收准备 DMA buffer。
  *
  * RTL 中的软件复位是一个单周期命令，会清除序列计数器、传输计数器，
  * 并自动清除 CTRL。软件不需要再单独清除 reset 位。PACKET_LEN 和
@@ -60,15 +61,33 @@ static void stream_ctrl_prepare_rx(struct stream_ctrl_dev *sdev)
     /* 成功传输后，这个标记应被 0、1、...、15 完整覆盖。 */
     memset(sdev->rx_buf, 0xA5, sdev->rx_buf_size);
 
-    /* 提交新的 DMA 工作前，丢弃上一次的 completion 状态。 */
-    reinit_completion(&sdev->rx_completion);
+}
+
+static enum stream_rx_state
+stream_ctrl_get_rx_state(struct stream_ctrl_dev *sdev)
+{
+    unsigned long flags;
+    enum stream_rx_state new_state;
+    spin_lock_irqsave(&sdev->state_lock, flags);
+    new_state = sdev->rx_state;
+    spin_unlock_irqrestore(&sdev->state_lock, flags);
+    return new_state;
+}
+
+static void stream_ctrl_set_rx_state(struct stream_ctrl_dev *sdev,
+                                    enum stream_rx_state new_state)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&sdev->state_lock, flags);
+    sdev->rx_state = new_state;
+    spin_unlock_irqrestore(&sdev->state_lock, flags);
 }
 
 /*
  * DMAEngine 完成回调。
  *
  * 这个回调可能运行在 DMAEngine 的中断或 tasklet 相关上下文中，因此不能
- * 睡眠、遍历 buffer 或输出大量日志。complete() 只记录完成事件，并唤醒
+ * 睡眠、遍历 buffer 或输出大量日志。回调只更新接收状态并唤醒
  * 处于进程上下文中的等待路径。
  */
 static void stream_ctrl_dma_callback(void *args)
@@ -76,7 +95,8 @@ static void stream_ctrl_dma_callback(void *args)
     struct stream_ctrl_dev *sdev = args;
 
     stream_ctrl_hw_stop(sdev);
-    complete(&sdev->rx_completion);
+    stream_ctrl_set_rx_state(sdev, STREAM_RX_DONE);
+    wake_up_interruptible(&sdev->rx_wait);
 }
 
 /*
@@ -145,27 +165,48 @@ static int submit_assist(struct stream_ctrl_dev *sdev,
     return 0;
 }
 
+static int stream_ctrl_abort_rx(struct stream_ctrl_dev *sdev)
+{
+    int ret;
+    stream_ctrl_hw_stop(sdev);
+    ret = dmaengine_terminate_sync(sdev->rx_channel);
+    if (ret) {
+        stream_ctrl_set_rx_state(sdev, STREAM_RX_FAULT);
+        return ret;
+    }
+    stream_ctrl_set_rx_state(sdev, STREAM_RX_IDLE);
+    return 0;
+}
+
 /*
  * 执行一次完整的 RX 传输，但暂不校验 buffer 数据。
  *
- * 这个函数必须运行在允许睡眠的进程上下文中，因为
- * wait_for_completion_timeout() 可能睡眠。DMA 完成回调不会调用这个函数，
- * 回调只负责 complete(&sdev->rx_completion)。
+ * 这个函数必须运行在允许睡眠的进程上下文中，因为等待数据时可能睡眠。
+ * DMA 完成回调不会调用这个函数，只负责更新接收状态并唤醒等待路径。
  */
 static int stream_ctrl_receive_once(struct stream_ctrl_dev *sdev)
 {
     dma_cookie_t cookie;
     struct dma_tx_state state = {};
-    enum dma_status status;
-    unsigned long wait_ret;
+    enum dma_status dma_status;
+    enum stream_rx_state stream_rx_state;
+    long wait_ret;
     int ret;
 
-    /* 把 RTL、buffer 和 completion 都准备到确定的初始状态。 */
+    stream_rx_state = stream_ctrl_get_rx_state(sdev);
+    if (stream_rx_state == STREAM_RX_FAULT) {
+        return -EIO;
+    }
+
+    /* 把 RTL、buffer 和接收状态准备到确定的初始状态。 */
     stream_ctrl_prepare_rx(sdev);
+
+    stream_ctrl_set_rx_state(sdev, STREAM_RX_IN_FLIGHT);
 
     /* 先让 DMA descriptor 就绪，再允许 stream_gen 产生数据。 */
     ret = submit_assist(sdev, &cookie);
     if (ret) {
+        stream_ctrl_set_rx_state(sdev, STREAM_RX_IDLE);
         dev_err(sdev->dev, "submit failed: %d\n", ret);
         return ret;
     }
@@ -174,47 +215,50 @@ static int stream_ctrl_receive_once(struct stream_ctrl_dev *sdev)
     stream_ctrl_hw_start(sdev);
 
     /* 等待 DMAEngine 回调，但不能无限等待。 */
-    wait_ret = wait_for_completion_timeout(
-        &sdev->rx_completion,
+    wait_ret = wait_event_interruptible_timeout(
+        sdev->rx_wait,
+        stream_ctrl_get_rx_state(sdev) == STREAM_RX_DONE,
         msecs_to_jiffies(1000));
-    if (!wait_ret) {
-        /* 在终止 channel 前保存 DMA 状态，便于分析超时原因。 */
-        status = dmaengine_tx_status(sdev->rx_channel, cookie, &state);
-
-        /* 先停止数据生产者，再终止 DMA 并等待回调结束。 */
-        stream_ctrl_hw_stop(sdev);
-        dmaengine_terminate_sync(sdev->rx_channel);
-
-        dev_err(sdev->dev, "completion timeout, dma status=%d\n", status);
+    if (wait_ret == 0) {
+        ret = stream_ctrl_abort_rx(sdev);
+        if (ret)
+            return ret;
         return -ETIMEDOUT;
     }
 
+    if (wait_ret < 0) {
+        ret = stream_ctrl_abort_rx(sdev);
+        if (ret)
+            return ret;
+        return wait_ret;
+    }
     /* buffer 已完成本次请求，停止 generator，避免它继续产生数据。 */
     stream_ctrl_hw_stop(sdev);
 
-    /* completion 到达并不等于 DMA 状态一定正常，还要查询 DMAEngine 状态。 */
-    status = dmaengine_tx_status(sdev->rx_channel, cookie, &state);
-    if (status != DMA_COMPLETE) {
-        dev_err(sdev->dev, "DMA completed with unexpected status=%d\n", status);
+    /* 回调到达并不等于 DMA 状态一定正常，还要查询 DMAEngine 状态。 */
+    dma_status = dmaengine_tx_status(sdev->rx_channel, cookie, &state);
+    if (dma_status != DMA_COMPLETE || state.residue) {
+        dev_err(sdev->dev,
+                "DMA completed with dma_status=%d residue=%u\n",
+                dma_status, state.residue);
 
         /* DMA 状态异常时，不能让 channel 保持在未知状态。 */
-        dmaengine_terminate_sync(sdev->rx_channel);
+        ret = stream_ctrl_abort_rx(sdev);
+        if (ret)
+            return ret;
         return -EIO;
     }
 
-    /*
-     * 正常完成后的 terminate 为 Week 4 遗留的防御性清理。
-     * 当前 RTL 一次启动只发送一包，其必要性尚未确认；
-     * 暂时保留，待板端 A/B 测试后决定是否删除。
-     */
+    /* 正常完成后终止 DMA，但保留 DONE，直到 read() 完成数据拷贝。 */
     ret = dmaengine_terminate_sync(sdev->rx_channel);
     if (ret) {
         dev_err(sdev->dev,
                 "failed to reset RX DMA channel: %d\n",
                 ret);
+        stream_ctrl_set_rx_state(sdev, STREAM_RX_FAULT);
         return ret;
     }
-    
+
     dev_dbg(sdev->dev,
         "RX counters after stop: words=%u, packets=%u\n",
         stream_ctrl_read(sdev, STREAM_REG_WORD_COUNT),
@@ -224,36 +268,6 @@ static int stream_ctrl_receive_once(struct stream_ctrl_dev *sdev)
 }
 
 /* 读取并打印 stream_gen 的寄存器 */
-static void stream_ctrl_dump_regs(struct stream_ctrl_dev *sdev)
-{
-    u32 ctrl;
-    u32 status;
-    u32 packet_len;
-    u32 rate_div;
-    u32 word_count;
-    u32 packet_count;
-    u32 backpressure_count;
-    u32 version;
-
-    ctrl               = stream_ctrl_read(sdev, STREAM_REG_CTRL);
-    status             = stream_ctrl_read(sdev, STREAM_REG_STATUS);
-    packet_len         = stream_ctrl_read(sdev, STREAM_REG_PACKET_LEN);
-    rate_div           = stream_ctrl_read(sdev, STREAM_REG_RATE_DIV);
-    word_count         = stream_ctrl_read(sdev, STREAM_REG_WORD_COUNT);
-    packet_count       = stream_ctrl_read(sdev, STREAM_REG_PACKET_COUNT);
-    backpressure_count = stream_ctrl_read(sdev, STREAM_REG_BACKPRESSURE_COUNT);
-    version            = stream_ctrl_read(sdev, STREAM_REG_VERSION);
-
-    dev_info(sdev->dev, "stream_ctrl: CTRL               = 0x%08x\n", ctrl);
-    dev_info(sdev->dev, "stream_ctrl: STATUS             = 0x%08x\n", status);
-    dev_info(sdev->dev, "stream_ctrl: PACKET_LEN         = 0x%08x\n", packet_len);
-    dev_info(sdev->dev, "stream_ctrl: RATE_DIV           = 0x%08x\n", rate_div);
-    dev_info(sdev->dev, "stream_ctrl: WORD_COUNT         = 0x%08x\n", word_count);
-    dev_info(sdev->dev, "stream_ctrl: PACKET_COUNT       = 0x%08x\n", packet_count);
-    dev_info(sdev->dev, "stream_ctrl: BACKPRESSURE_COUNT = 0x%08x\n", backpressure_count);
-    dev_info(sdev->dev, "stream_ctrl: VERSION            = 0x%08x\n", version);
-}
-
 static int stream_ctrl_open(struct inode *inode, struct file* filp)
 {
     struct stream_ctrl_dev *sdev;
@@ -277,19 +291,23 @@ static ssize_t stream_ctrl_file_read(struct file *filp, char __user *buf,
     if (count == 0) return 0;
     if (count < STREAM_RX_BUF_SIZE) return -EMSGSIZE;
 
-    mutex_lock(&sdev->io_lock);
+    ret = mutex_lock_interruptible(&sdev->io_lock);
+    if (ret) {
+        dev_err(sdev->dev, "mutex lock acquire failed!\n");
+        return ret;
+    }
 
     ret = stream_ctrl_receive_once(sdev);
-    if (ret) {
-        stream_ctrl_dump_regs(sdev);
+    if (ret)
         goto out_unlock;
-    }
 
     if (copy_to_user(buf, sdev->rx_buf, STREAM_RX_BUF_SIZE))
         ret = -EFAULT;
     else
         ret = STREAM_RX_BUF_SIZE;
     
+    stream_ctrl_set_rx_state(sdev, STREAM_RX_IDLE);
+
 out_unlock:
     mutex_unlock(&sdev->io_lock);
     return ret;
@@ -307,6 +325,7 @@ static int stream_ctrl_probe(struct platform_device *pdev)
 {
     struct stream_ctrl_dev *sdev;
     struct resource *res;
+    u32 version;
     int ret;
 
     /* devm_kzalloc() 会把 sdev 的生命周期绑定到 platform device。 */
@@ -316,8 +335,8 @@ static int stream_ctrl_probe(struct platform_device *pdev)
 
     sdev->dev = &pdev->dev;
 
-    /* probe 时初始化一次；之后每次传输使用 reinit_completion()。 */
-    init_completion(&sdev->rx_completion);
+    /* probe 时初始化一次接收等待队列、状态锁和初始状态。 */
+
     
     mutex_init(&sdev->io_lock);
 
@@ -334,6 +353,15 @@ static int stream_ctrl_probe(struct platform_device *pdev)
     if (IS_ERR(sdev->base)) {
         dev_err(&pdev->dev, "stream_ctrl: ioremap failed\n");
         return PTR_ERR(sdev->base);
+    }
+
+    version = stream_ctrl_read(sdev, STREAM_REG_VERSION);
+    if (version != STREAM_CTRL_VERSION) {
+        dev_err(&pdev->dev,
+                "stream_ctrl: incompatible stream_gen version 0x%08x, "
+                "expected 0x%08x\n",
+                version, STREAM_CTRL_VERSION);
+        return -ENODEV;
     }
 
     /* 保存 sdev，使 remove() 和后续驱动操作可以取得设备私有数据。 */
@@ -365,6 +393,10 @@ static int stream_ctrl_probe(struct platform_device *pdev)
         return -ENOMEM;
     }
 
+    init_waitqueue_head(&sdev->rx_wait);
+    spin_lock_init(&sdev->state_lock);
+    sdev->rx_state = STREAM_RX_IDLE;
+
     dev_info(&pdev->dev,
              "stream_ctrl: DMA RX buffer allocated, size=%zu, dma=%pad\n",
              sdev->rx_buf_size, &sdev->rx_dma_addr);
@@ -383,8 +415,6 @@ static int stream_ctrl_probe(struct platform_device *pdev)
         dev_err(&pdev->dev, "device_create failed: %d\n", ret);
         goto err_cdev_del;
     }
-
-    stream_ctrl_dump_regs(sdev);
 
     return 0;
 
@@ -424,7 +454,7 @@ static int stream_ctrl_remove(struct platform_device *pdev)
      * 释放 callback 或 DMAEngine 可能仍然访问的内存。
      */
     if (sdev && sdev->rx_channel) {
-        dmaengine_terminate_sync(sdev->rx_channel);
+        stream_ctrl_abort_rx(sdev);
     }
 
     if (sdev) {

@@ -253,7 +253,7 @@ initial begin
     axi_read(REG_BACKPRESSURE_COUNT, read_data);
     check32("BACKPRESSURE_COUNT 复位值", read_data, 32'd0);
     axi_read(REG_VERSION, read_data);
-    check32("VERSION 固定值", read_data, 32'h0001_0000);
+    check32("VERSION 固定值", read_data, 32'h0001_0001);
     check1("TVALID 复位值", m_axis_tvalid, 1'b0);
     check32("TKEEP 固定值", {28'd0, m_axis_tkeep}, 32'h0000_000f);
 

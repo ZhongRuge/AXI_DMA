@@ -3,13 +3,14 @@
 
 #include <linux/bitops.h>
 #include <linux/dma-mapping.h>
-#include <linux/completion.h>
 #include <linux/device.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/types.h>
 #include <linux/cdev.h>
 #include <linux/mutex.h>
+#include <linux/wait.h>
+#include <linux/spinlock.h>
 
 #define STREAM_CTRL_DRV_NAME       "stream_ctrl"
 
@@ -24,6 +25,8 @@
 #define STREAM_REG_BACKPRESSURE_COUNT 0x18  /* 背压计数 */
 #define STREAM_REG_VERSION            0x1c  /* IP 版本 */
 
+#define STREAM_CTRL_VERSION           0x00010000U
+
 #define STREAM_CTRL_ENABLE    BIT(0)  /* 使能数据流 */
 #define STREAM_CTRL_RESET     BIT(1)  /* IP 软件复位命令 */
 
@@ -36,6 +39,13 @@
 
 struct dma_chan;
 
+enum stream_rx_state {
+    STREAM_RX_IDLE,
+    STREAM_RX_IN_FLIGHT,
+    STREAM_RX_DONE,
+    STREAM_RX_FAULT,
+};
+
 struct stream_ctrl_dev {
     struct device *dev;      /* Linux 设备对象 */
     void __iomem *base;      /* MMIO 虚拟基地址 */
@@ -46,12 +56,15 @@ struct stream_ctrl_dev {
     void *rx_buf;            /* CPU 访问 buffer 的虚拟地址 */
     dma_addr_t rx_dma_addr;  /* DMA 访问 buffer 的地址 */
     size_t rx_buf_size;      /* buffer 长度，单位：字节 */
-    struct completion rx_completion; /* DMA 完成通知 */
 
     struct cdev cdev;         /* 字符设备对象（5.1b 由 cdev_init/cdev_add 初始化） */
     struct device *dev_node;  /* device_create() 返回的设备节点指针 */
 
     struct mutex io_lock;
+
+    wait_queue_head_t rx_wait;
+    enum stream_rx_state rx_state;
+    spinlock_t state_lock;
 };
 
 void stream_ctrl_hw_start(struct stream_ctrl_dev *sdev);
