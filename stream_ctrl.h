@@ -11,6 +11,7 @@
 #include <linux/mutex.h>
 #include <linux/wait.h>
 #include <linux/spinlock.h>
+#include <linux/dmaengine.h>
 
 #define STREAM_CTRL_DRV_NAME       "stream_ctrl"
 
@@ -43,6 +44,7 @@ enum stream_rx_state {
     STREAM_RX_IDLE,
     STREAM_RX_IN_FLIGHT,
     STREAM_RX_DONE,
+    STREAM_RX_CANCELLED,     /* DMA 已停止，取消通知保留到最后关闭。 */
     STREAM_RX_FAULT,
 };
 
@@ -65,6 +67,10 @@ struct stream_ctrl_dev {
     wait_queue_head_t rx_wait;
     enum stream_rx_state rx_state;
     spinlock_t state_lock;
+
+    dma_cookie_t rx_cookie;
+
+    unsigned int open_count;
 };
 
 void stream_ctrl_hw_start(struct stream_ctrl_dev *sdev);

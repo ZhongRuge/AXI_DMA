@@ -9,6 +9,7 @@
 #include <linux/string.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
+#include <linux/poll.h>
 
 #include "stream_ctrl.h"
 
@@ -93,10 +94,20 @@ static void stream_ctrl_set_rx_state(struct stream_ctrl_dev *sdev,
 static void stream_ctrl_dma_callback(void *args)
 {
     struct stream_ctrl_dev *sdev = args;
+    unsigned long flags;
+    bool notify = false;
 
     stream_ctrl_hw_stop(sdev);
-    stream_ctrl_set_rx_state(sdev, STREAM_RX_DONE);
-    wake_up_interruptible(&sdev->rx_wait);
+
+    spin_lock_irqsave(&sdev->state_lock, flags);
+    if (sdev->rx_state == STREAM_RX_IN_FLIGHT) {
+        sdev->rx_state = STREAM_RX_DONE;
+        notify = true;
+    }
+    spin_unlock_irqrestore(&sdev->state_lock, flags);
+
+    if (notify)
+        wake_up_interruptible(&sdev->rx_wait);
 }
 
 /*
@@ -172,47 +183,43 @@ static int stream_ctrl_abort_rx(struct stream_ctrl_dev *sdev)
     ret = dmaengine_terminate_sync(sdev->rx_channel);
     if (ret) {
         stream_ctrl_set_rx_state(sdev, STREAM_RX_FAULT);
+        wake_up_interruptible(&sdev->rx_wait);
         return ret;
     }
-    stream_ctrl_set_rx_state(sdev, STREAM_RX_IDLE);
+    /* 保留取消通知，让其他读取者和 poll 等待者能够观察到。 */
+    stream_ctrl_set_rx_state(sdev, STREAM_RX_CANCELLED);
+    wake_up_interruptible(&sdev->rx_wait);
     return 0;
 }
 
-/*
- * 执行一次完整的 RX 传输，但暂不校验 buffer 数据。
- *
- * 这个函数必须运行在允许睡眠的进程上下文中，因为等待数据时可能睡眠。
- * DMA 完成回调不会调用这个函数，只负责更新接收状态并唤醒等待路径。
- */
-static int stream_ctrl_receive_once(struct stream_ctrl_dev *sdev)
+static int stream_ctrl_start_rx(struct stream_ctrl_dev *sdev)
 {
-    dma_cookie_t cookie;
-    struct dma_tx_state state = {};
-    enum dma_status dma_status;
-    enum stream_rx_state stream_rx_state;
-    long wait_ret;
     int ret;
+    enum stream_rx_state stream_rx_state;
 
     stream_rx_state = stream_ctrl_get_rx_state(sdev);
-    if (stream_rx_state == STREAM_RX_FAULT) {
-        return -EIO;
+    if (stream_rx_state != STREAM_RX_IDLE) {
+        if (stream_rx_state == STREAM_RX_FAULT) return -EIO;
+        if (stream_rx_state == STREAM_RX_CANCELLED) return -ECANCELED;
+        return -EBUSY;
     }
 
-    /* 把 RTL、buffer 和接收状态准备到确定的初始状态。 */
     stream_ctrl_prepare_rx(sdev);
-
     stream_ctrl_set_rx_state(sdev, STREAM_RX_IN_FLIGHT);
-
-    /* 先让 DMA descriptor 就绪，再允许 stream_gen 产生数据。 */
-    ret = submit_assist(sdev, &cookie);
+    ret = submit_assist(sdev, &sdev->rx_cookie);
     if (ret) {
         stream_ctrl_set_rx_state(sdev, STREAM_RX_IDLE);
-        dev_err(sdev->dev, "submit failed: %d\n", ret);
         return ret;
     }
 
-    /* 只有 S2MM channel 准备完成后，才启动数据生产者。 */
     stream_ctrl_hw_start(sdev);
+    return 0;
+}
+
+static int stream_ctrl_wait_rx(struct stream_ctrl_dev *sdev)
+{
+    int ret;
+    long wait_ret;
 
     /* 等待 DMAEngine 回调，但不能无限等待。 */
     wait_ret = wait_event_interruptible_timeout(
@@ -235,8 +242,17 @@ static int stream_ctrl_receive_once(struct stream_ctrl_dev *sdev)
     /* buffer 已完成本次请求，停止 generator，避免它继续产生数据。 */
     stream_ctrl_hw_stop(sdev);
 
+    return 0;
+}
+
+static int stream_ctrl_finish_rx(struct stream_ctrl_dev *sdev)
+{
+    int ret;
+    enum dma_status dma_status;
+    struct dma_tx_state state = {};
+
     /* 回调到达并不等于 DMA 状态一定正常，还要查询 DMAEngine 状态。 */
-    dma_status = dmaengine_tx_status(sdev->rx_channel, cookie, &state);
+    dma_status = dmaengine_tx_status(sdev->rx_channel, sdev->rx_cookie, &state);
     if (dma_status != DMA_COMPLETE || state.residue) {
         dev_err(sdev->dev,
                 "DMA completed with dma_status=%d residue=%u\n",
@@ -256,28 +272,56 @@ static int stream_ctrl_receive_once(struct stream_ctrl_dev *sdev)
                 "failed to reset RX DMA channel: %d\n",
                 ret);
         stream_ctrl_set_rx_state(sdev, STREAM_RX_FAULT);
+        wake_up_interruptible(&sdev->rx_wait);
         return ret;
     }
-
-    dev_dbg(sdev->dev,
-        "RX counters after stop: words=%u, packets=%u\n",
-        stream_ctrl_read(sdev, STREAM_REG_WORD_COUNT),
-        stream_ctrl_read(sdev, STREAM_REG_PACKET_COUNT));
-
     return 0;
 }
 
-/* 读取并打印 stream_gen 的寄存器 */
+/* 将设备私有数据关联到当前打开的文件。 */
 static int stream_ctrl_open(struct inode *inode, struct file* filp)
 {
+    int ret;
+
     struct stream_ctrl_dev *sdev;
     sdev = container_of(inode->i_cdev, struct stream_ctrl_dev, cdev);
     filp->private_data = sdev;
-    return nonseekable_open(inode, filp);
+
+    ret = nonseekable_open(inode, filp);
+    if (ret) return ret;
+
+    ret = mutex_lock_interruptible(&sdev->io_lock);
+    if (ret) return ret;
+
+    sdev->open_count += 1;
+
+    mutex_unlock(&sdev->io_lock);
+    return 0;
 }
 
 static int stream_ctrl_release(struct inode *inode, struct file *filp)
 {
+    int ret;
+    struct stream_ctrl_dev *sdev;
+    enum stream_rx_state rx_state;
+    sdev = filp->private_data;
+
+    mutex_lock(&sdev->io_lock);
+    sdev->open_count -= 1;
+
+    if (sdev->open_count == 0) {
+        rx_state = stream_ctrl_get_rx_state(sdev);
+        if (rx_state != STREAM_RX_IDLE) {
+            ret = stream_ctrl_abort_rx(sdev);
+            if (ret)
+                dev_err(sdev->dev, "RX cleanup on last close failed: %d\n", ret);
+            else
+                /* 所有打开者都已离开，可以清除取消通知。 */
+                stream_ctrl_set_rx_state(sdev, STREAM_RX_IDLE);
+        }
+    }
+    mutex_unlock(&sdev->io_lock);
+
     return 0;
 }
 
@@ -286,20 +330,52 @@ static ssize_t stream_ctrl_file_read(struct file *filp, char __user *buf,
 {
     int ret;
     struct stream_ctrl_dev *sdev;
+    enum stream_rx_state rx_state;
+
     sdev = filp->private_data;
 
     if (count == 0) return 0;
     if (count < STREAM_RX_BUF_SIZE) return -EMSGSIZE;
 
-    ret = mutex_lock_interruptible(&sdev->io_lock);
-    if (ret) {
-        dev_err(sdev->dev, "mutex lock acquire failed!\n");
-        return ret;
+    // 拿到lock
+    if (filp->f_flags & O_NONBLOCK) { // 非阻塞
+        if (!mutex_trylock(&sdev->io_lock)) return -EAGAIN;
+    } else { // 阻塞
+        ret = mutex_lock_interruptible(&sdev->io_lock);
+        if (ret) return ret;
     }
 
-    ret = stream_ctrl_receive_once(sdev);
-    if (ret)
+    // 开始传输
+    rx_state = stream_ctrl_get_rx_state(sdev);
+    if (rx_state == STREAM_RX_FAULT) {
+        ret = -EIO;
         goto out_unlock;
+    }
+    if (rx_state == STREAM_RX_CANCELLED) {
+        ret = -ECANCELED;
+        goto out_unlock;
+    }
+    if (rx_state == STREAM_RX_IDLE) {
+        ret = stream_ctrl_start_rx(sdev);
+        if (ret) goto out_unlock;
+    }
+
+    // 等待传输过程
+    rx_state = stream_ctrl_get_rx_state(sdev);
+    if (rx_state != STREAM_RX_DONE) {
+        if (filp->f_flags & O_NONBLOCK) {
+            ret = -EAGAIN;
+            goto out_unlock;
+        }
+
+        ret = stream_ctrl_wait_rx(sdev);
+        if (ret)
+            goto out_unlock;
+    }
+
+    // 检查传输结果
+    ret = stream_ctrl_finish_rx(sdev);
+    if (ret) goto out_unlock;
 
     if (copy_to_user(buf, sdev->rx_buf, STREAM_RX_BUF_SIZE))
         ret = -EFAULT;
@@ -313,12 +389,28 @@ out_unlock:
     return ret;
 }
 
+static __poll_t stream_ctrl_poll(struct file *filp, poll_table *wait)
+{
+    struct stream_ctrl_dev *sdev;
+    enum stream_rx_state rx_state;
+
+    sdev = filp->private_data;
+    poll_wait(filp, &sdev->rx_wait, wait);
+
+    rx_state = stream_ctrl_get_rx_state(sdev);
+    if (rx_state == STREAM_RX_DONE) return POLLIN | POLLRDNORM;
+    if (rx_state == STREAM_RX_FAULT || rx_state == STREAM_RX_CANCELLED)
+        return POLLERR;
+    return 0;
+}
+
 static struct file_operations stream_ctrl_fops = {
     .owner = THIS_MODULE,
     .open = stream_ctrl_open,
     .release = stream_ctrl_release,
     .read = stream_ctrl_file_read,
-    .llseek = no_llseek
+    .llseek = no_llseek,
+    .poll = stream_ctrl_poll
 };
 
 static int stream_ctrl_probe(struct platform_device *pdev)
