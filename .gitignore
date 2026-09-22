@@ -1,6 +1,17 @@
-# Legacy projects must remain outside this repository
-/Navigator_7020/
+# Legacy project
 /Vivado_project/
+
+# Kernel module and userspace build outputs
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+/.tmp_versions/
+/Module.symvers
+/modules.order
+/zstream
+*.dtb
 
 # Vivado generated directories
 /.Xil/

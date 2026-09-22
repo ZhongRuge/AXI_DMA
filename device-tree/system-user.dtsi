@@ -1,0 +1,45 @@
+/* 按教程第 20 章，不再包含 system-conf.dtsi，板级配置集中写在这里。 */
+
+/ {
+	model = "Alientek Navigator Zynq Development Board";
+	compatible = "xlnx,zynq-zc702", "xlnx,zynq-7000";
+
+	chosen {
+		/* 保留本项目实际使用的 NFS 根文件系统和静态 IP。 */
+		bootargs = "console=ttyPS0,115200 root=/dev/nfs rw nfsroot=192.168.1.11:/home/zy/workspace/nfs/rootfs,nfsvers=3 ip=192.168.1.10:192.168.1.11:192.168.1.11:255.255.255.0::eth0:off";
+		stdout-path = "serial0:115200n8";
+	};
+};
+
+&uart0 {
+	u-boot,dm-pre-reloc;
+	status = "okay";
+};
+
+&sdhci0 {
+	u-boot,dm-pre-reloc;
+	status = "okay";
+};
+
+&gem0 {
+	/* 沿用原系统的 MAC；PHY 地址按教程第 20 章及官方板级文件配置。 */
+	local-mac-address = [00 0a 35 00 1e 53];
+	phy-handle = <&ethernet_phy>;
+
+	ethernet_phy: ethernet-phy@7 {
+		reg = <0x7>;
+		device_type = "ethernet-phy";
+	};
+};
+
+&axi_dma_0 {
+	status = "okay";
+};
+
+/* 地址、中断和时钟来自新 XSA 生成的 pl.dtsi；这里只补驱动关联。 */
+&stream_gen_0 {
+	compatible = "zrg,zynq-stream-axidma";
+	dmas = <&axi_dma_0 1>;
+	dma-names = "rx";
+	status = "okay";
+};

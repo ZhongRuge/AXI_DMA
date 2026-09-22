@@ -26,7 +26,7 @@
 #define STREAM_REG_BACKPRESSURE_COUNT 0x18  /* 背压计数 */
 #define STREAM_REG_VERSION            0x1c  /* IP 版本 */
 
-#define STREAM_CTRL_VERSION           0x00010000U
+#define STREAM_CTRL_VERSION           0x00010001U
 
 #define STREAM_CTRL_ENABLE    BIT(0)  /* 使能数据流 */
 #define STREAM_CTRL_RESET     BIT(1)  /* IP 软件复位命令 */
