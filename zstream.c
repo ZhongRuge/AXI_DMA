@@ -13,7 +13,7 @@
 #define PKT_SIZE   64
 #define PKT_WORDS  16
 
-/* 参数只接受正整数，避免把拼错的参数当成正常测试。 */
+/* 解析正整数参数，格式或范围错误时返回 -1。 */
 static int parse_positive(const char *text)
 {
     char *end;
@@ -26,6 +26,7 @@ static int parse_positive(const char *text)
     return (int)value;
 }
 
+/* 读取并校验设备数据，结束后输出统计。 */
 int main(int argc, char *argv[])
 {
     unsigned char buf[PKT_SIZE];
@@ -39,7 +40,6 @@ int main(int argc, char *argv[])
     struct timespec start, now;
     struct pollfd pfd;
 
-    /* 1. 解析参数：按包数或按时长测试，两种限制不混用。 */
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--count") == 0 && i + 1 < argc) {
             count = parse_positive(argv[++i]);
@@ -57,7 +57,6 @@ int main(int argc, char *argv[])
     if (count <= 0 || seconds < 0 || (seconds && (!poll_mode || count_set)))
         goto usage;
 
-    /* 2. 原模式阻塞打开；poll 模式使用非阻塞 read。 */
     fd = open(DEV_PATH, O_RDONLY | (poll_mode ? O_NONBLOCK : 0));
     if (fd < 0) {
         perror("open " DEV_PATH);
@@ -71,7 +70,6 @@ int main(int argc, char *argv[])
     pfd.fd = fd;
     pfd.events = POLLIN;
 
-    /* 3. 每次先 read：收到数据就校验，EAGAIN 就去 poll 等待。 */
     while (seconds || packets < (unsigned int)count) {
         ssize_t n;
         int timeout_ms = 1000;
@@ -133,7 +131,7 @@ int main(int argc, char *argv[])
             break;
         }
 
-        /* 4. 沿用原校验：每包 16 个 word，预期为 0～15。 */
+        /* 每包独立校验，预期的 16 个 word 为 0～15。 */
         packets++;
         if (verify) {
             for (w = 0; w < PKT_WORDS; w++) {
@@ -160,14 +158,12 @@ int main(int argc, char *argv[])
             data_err_cnt++;
     }
 
-    /* 5. 关闭并汇总。Ctrl+C 使用默认行为：进程退出，内核释放文件引用。 */
     if (close(fd) < 0) {
         perror("close");
         read_err_cnt++;
     }
     printf("success=%u data_error=%u read_error=%u\n",
            success_cnt, data_err_cnt, read_err_cnt);
-    /* poll_events 是 poll 返回就绪事件的次数，不是调度器唤醒次数。 */
     if (poll_mode)
         printf("packets=%u poll_events=%u\n", packets, poll_events);
     if (first_err_word >= 0)
