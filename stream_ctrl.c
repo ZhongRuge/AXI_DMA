@@ -1,21 +1,21 @@
+/* 接收主线：read 安排工作，工作线程提交 DMA，回调公布数据。 */
 #include <linux/dmaengine.h>
 #include <linux/err.h>
 #include <linux/errno.h>
+#include <linux/fs.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/poll.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/fs.h>
 #include <linux/uaccess.h>
-#include <linux/poll.h>
 
 #include "stream_ctrl.h"
 
 static dev_t stream_dev_num;
 static struct class *stream_class;
-
 
 /* 读取 stream_gen 的 32 位寄存器。 */
 static u32 stream_ctrl_read(struct stream_ctrl_dev *sdev, u32 reg)
@@ -29,19 +29,17 @@ static void stream_ctrl_write(struct stream_ctrl_dev *sdev, u32 reg, u32 value)
     writel(value, sdev->base + reg);
 }
 
-/* 复位并配置发生器，填充接收缓冲区。 */
+/* 配置本包的发生器参数，并给接收缓冲区填入检查标记。 */
 static void stream_ctrl_prepare_rx(struct stream_rx_buffer *buf)
 {
     struct stream_ctrl_dev *sdev = buf->sdev;
 
     stream_ctrl_hw_stop(sdev);
-
     stream_ctrl_hw_reset(sdev);
-
     stream_ctrl_write(sdev, STREAM_REG_PACKET_LEN, STREAM_RX_WORDS);
     stream_ctrl_write(sdev, STREAM_REG_RATE_DIV, 1000);
 
-    /* 成功传输后，这个标记应被 0、1、...、15 完整覆盖。 */
+    /* 正常接收后，0xA5 应被整包数据覆盖。 */
     memset(buf->cpu_addr, 0xA5, buf->size);
 }
 
@@ -49,12 +47,14 @@ static void stream_ctrl_prepare_rx(struct stream_rx_buffer *buf)
 static enum stream_rx_state
 stream_ctrl_get_rx_state(struct stream_ctrl_dev *sdev)
 {
+    enum stream_rx_state state;
     unsigned long flags;
-    enum stream_rx_state new_state;
+
     spin_lock_irqsave(&sdev->state_lock, flags);
-    new_state = sdev->rx_state;
+    state = sdev->rx_state;
     spin_unlock_irqrestore(&sdev->state_lock, flags);
-    return new_state;
+
+    return state;
 }
 
 /* 判断下一包数据是否已经就绪。 */
@@ -62,11 +62,9 @@ static bool stream_ctrl_has_ready_buffer(struct stream_ctrl_dev *sdev)
 {
     unsigned long flags;
     bool ready;
-    ready = 0;
 
     spin_lock_irqsave(&sdev->state_lock, flags);
-    if (sdev->rx_buffers[sdev->rx_read_index].state == STREAM_BUF_READY)
-        ready = 1;
+    ready = (sdev->rx_buffers[sdev->rx_read_index].state == STREAM_BUF_READY);
     spin_unlock_irqrestore(&sdev->state_lock, flags);
 
     return ready;
@@ -77,12 +75,13 @@ static void stream_ctrl_set_rx_state(struct stream_ctrl_dev *sdev,
                                     enum stream_rx_state new_state)
 {
     unsigned long flags;
+
     spin_lock_irqsave(&sdev->state_lock, flags);
     sdev->rx_state = new_state;
     spin_unlock_irqrestore(&sdev->state_lock, flags);
 }
 
-/* 按写索引领取空闲缓冲区。 */
+/* 按写索引领取 FREE 缓冲区，调用者须持有 state_lock。 */
 static struct stream_rx_buffer *
 stream_ctrl_take_free_buffer(struct stream_ctrl_dev *sdev)
 {
@@ -93,10 +92,11 @@ stream_ctrl_take_free_buffer(struct stream_ctrl_dev *sdev)
 
     buf->state = STREAM_BUF_IN_FLIGHT;
     sdev->rx_write_index = (sdev->rx_write_index + 1) % STREAM_RX_BUF_COUNT;
+
     return buf;
 }
 
-/* 按读索引领取已完成的缓冲区。 */
+/* 按读索引领取 READY 缓冲区，调用者须持有 state_lock。 */
 static struct stream_rx_buffer *
 stream_ctrl_take_ready_buffer(struct stream_ctrl_dev *sdev)
 {
@@ -107,6 +107,7 @@ stream_ctrl_take_ready_buffer(struct stream_ctrl_dev *sdev)
 
     buf->state = STREAM_BUF_USER_READING;
     sdev->rx_read_index = (sdev->rx_read_index + 1) % STREAM_RX_BUF_COUNT;
+
     return buf;
 }
 
@@ -127,7 +128,8 @@ static void stream_ctrl_dma_callback(void *args)
         sdev->stats.rx_packets++;
         sdev->stats.rx_bytes += buf->size;
         sdev->rx_state = STREAM_RX_IDLE;
-        /* 在状态锁内排入工作，与取消路径互斥。 */
+
+        /* 续接和取消共用状态锁，防止取消后又排入新工作。 */
         schedule_work(&sdev->rx_work);
         notify = true;
     }
@@ -139,25 +141,22 @@ static void stream_ctrl_dma_callback(void *args)
 
 /* 为指定缓冲区准备 DMA 描述符和回调。 */
 static struct dma_async_tx_descriptor *
-prepare_descriptor(struct stream_rx_buffer *buf)
+stream_ctrl_prepare_descriptor(struct stream_rx_buffer *buf)
 {
     struct stream_ctrl_dev *sdev = buf->sdev;
     struct dma_async_tx_descriptor *descriptor;
+    unsigned long dma_flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
 
-    /* 请求完成中断回调，并确认这个单次使用的 descriptor。 */
-    unsigned long flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
-
-    /* DMA 设备写入 DMA 地址，不能把 CPU 虚拟地址传给硬件。 */
+    /* 硬件使用 dma_addr；CPU 访问缓冲区时使用 cpu_addr。 */
     descriptor = dmaengine_prep_slave_single(sdev->rx_channel,
-                                           buf->dma_addr,
-                                           buf->size,
-                                           DMA_DEV_TO_MEM,
-                                           flags);
-    if (!descriptor) {
+                                             buf->dma_addr,
+                                             buf->size,
+                                             DMA_DEV_TO_MEM,
+                                             dma_flags);
+    if (!descriptor)
         return NULL;
-    }
 
-    /* 保存回调函数，并把本次缓冲区指针传回回调。 */
+    /* 回调通过这个指针找到本次完成的缓冲区。 */
     descriptor->callback = stream_ctrl_dma_callback;
     descriptor->callback_param = buf;
 
@@ -165,24 +164,21 @@ prepare_descriptor(struct stream_rx_buffer *buf)
 }
 
 /* 提交 DMA 事务，保存 cookie 并启动接收。 */
-static int submit_assist(struct stream_rx_buffer *buf)
+static int stream_ctrl_submit_rx(struct stream_rx_buffer *buf)
 {
     struct stream_ctrl_dev *sdev = buf->sdev;
     struct dma_async_tx_descriptor *descriptor;
-    dma_cookie_t temp_cookie;
+    dma_cookie_t cookie;
 
-    descriptor = prepare_descriptor(buf);
-    if (!descriptor) {
+    descriptor = stream_ctrl_prepare_descriptor(buf);
+    if (!descriptor)
         return -ENOMEM;
-    }
 
-    temp_cookie = dmaengine_submit(descriptor);
-    if (dma_submit_error(temp_cookie)) {
-        return dma_submit_error(temp_cookie);
-    }
+    cookie = dmaengine_submit(descriptor);
+    if (dma_submit_error(cookie))
+        return dma_submit_error(cookie);
 
-    buf->cookie = temp_cookie;
-
+    buf->cookie = cookie;
     dma_async_issue_pending(sdev->rx_channel);
 
     return 0;
@@ -214,7 +210,7 @@ static void stream_ctrl_rx_work(struct work_struct *work)
         return;
 
     stream_ctrl_prepare_rx(buf);
-    ret = submit_assist(buf);
+    ret = stream_ctrl_submit_rx(buf);
     if (ret) {
         spin_lock_irqsave(&sdev->state_lock, flags);
         sdev->stats.errors++;
@@ -229,7 +225,7 @@ static void stream_ctrl_rx_work(struct work_struct *work)
     stream_ctrl_hw_start(sdev);
 }
 
-/* 禁止续接，等待工作和 DMA 停止，再回收未交付的数据。 */
+/* 禁止续接，请求停止接收，并回收未交付的数据。 */
 static int stream_ctrl_abort_rx(struct stream_ctrl_dev *sdev)
 {
     int ret;
@@ -243,6 +239,8 @@ static int stream_ctrl_abort_rx(struct stream_ctrl_dev *sdev)
 
     cancel_work_sync(&sdev->rx_work);
     stream_ctrl_hw_stop(sdev);
+
+    /* DMA 停止与回调同步依赖底层 DMA 驱动的实现。 */
     ret = dmaengine_terminate_sync(sdev->rx_channel);
     if (ret) {
         spin_lock_irqsave(&sdev->state_lock, flags);
@@ -252,7 +250,8 @@ static int stream_ctrl_abort_rx(struct stream_ctrl_dev *sdev)
         wake_up_interruptible(&sdev->rx_wait);
         return ret;
     }
-    /* DMA 已停止，回收未交付的数据；正在复制的缓冲区由 read() 归还。 */
+
+    /* 保留 USER_READING 缓冲区，由持有它的 read() 归还。 */
     spin_lock_irqsave(&sdev->state_lock, flags);
     for (i = 0; i < STREAM_RX_BUF_COUNT; i++) {
         if (sdev->rx_buffers[i].state == STREAM_BUF_READY)
@@ -273,21 +272,24 @@ static int stream_ctrl_abort_rx(struct stream_ctrl_dev *sdev)
 /* 等待数据就绪、故障或取消，超时和信号到达时终止接收。 */
 static int stream_ctrl_wait_rx(struct stream_ctrl_dev *sdev)
 {
-    int ret;
+    enum stream_rx_state rx_state;
     long wait_ret;
     unsigned long flags;
-    enum stream_rx_state rx_state;
+    int ret;
 
+    /* 等待数据，也等待故障或取消通知。 */
     wait_ret = wait_event_interruptible_timeout(
         sdev->rx_wait,
         stream_ctrl_has_ready_buffer(sdev) ||
         stream_ctrl_get_rx_state(sdev) == STREAM_RX_FAULT ||
         stream_ctrl_get_rx_state(sdev) == STREAM_RX_CANCELLED,
         msecs_to_jiffies(1000));
+
     if (wait_ret == 0) {
         spin_lock_irqsave(&sdev->state_lock, flags);
         sdev->stats.timeouts++;
         spin_unlock_irqrestore(&sdev->state_lock, flags);
+
         ret = stream_ctrl_abort_rx(sdev);
         if (ret)
             return ret;
@@ -315,23 +317,24 @@ static int stream_ctrl_wait_rx(struct stream_ctrl_dev *sdev)
 /* 检查指定 DMA 事务是否正常完成。 */
 static int stream_ctrl_finish_rx(struct stream_rx_buffer *buf)
 {
-    int ret;
-    unsigned long flags;
-    enum dma_status dma_status;
-    struct dma_tx_state state = {};
     struct stream_ctrl_dev *sdev = buf->sdev;
+    struct dma_tx_state state = {};
+    enum dma_status dma_status;
+    unsigned long flags;
+    int ret;
 
-    /* 回调到达并不等于 DMA 状态一定正常，还要查询 DMAEngine 状态。 */
+    /* 用本包 cookie 核对完成状态和剩余字节数。 */
     dma_status = dmaengine_tx_status(sdev->rx_channel, buf->cookie, &state);
     if (dma_status != DMA_COMPLETE || state.residue) {
         spin_lock_irqsave(&sdev->state_lock, flags);
         sdev->stats.errors++;
         spin_unlock_irqrestore(&sdev->state_lock, flags);
+
         dev_err(sdev->dev,
                 "DMA completed with dma_status=%d residue=%u\n",
                 dma_status, state.residue);
 
-        /* DMA 状态异常时，不能让 channel 保持在未知状态。 */
+        /* 状态异常时停止本轮接收。 */
         ret = stream_ctrl_abort_rx(sdev);
         if (ret)
             return ret;
@@ -364,20 +367,22 @@ static void stream_ctrl_log_stats(struct stream_ctrl_dev *sdev)
 }
 
 /* 关联设备对象并增加打开计数。 */
-static int stream_ctrl_open(struct inode *inode, struct file* filp)
+static int stream_ctrl_open(struct inode *inode, struct file *filp)
 {
-    int ret;
-    unsigned long flags;
-
     struct stream_ctrl_dev *sdev;
+    unsigned long flags;
+    int ret;
+
     sdev = container_of(inode->i_cdev, struct stream_ctrl_dev, cdev);
     filp->private_data = sdev;
 
     ret = nonseekable_open(inode, filp);
-    if (ret) return ret;
+    if (ret)
+        return ret;
 
     ret = mutex_lock_interruptible(&sdev->io_lock);
-    if (ret) return ret;
+    if (ret)
+        return ret;
 
     if (sdev->open_count == 0) {
         spin_lock_irqsave(&sdev->state_lock, flags);
@@ -394,8 +399,9 @@ static int stream_ctrl_open(struct inode *inode, struct file* filp)
 /* 减少打开计数，最后关闭时清理接收。 */
 static int stream_ctrl_release(struct inode *inode, struct file *filp)
 {
-    int ret;
     struct stream_ctrl_dev *sdev;
+    int ret;
+
     sdev = filp->private_data;
 
     mutex_lock(&sdev->io_lock);
@@ -411,38 +417,48 @@ static int stream_ctrl_release(struct inode *inode, struct file *filp)
 
         stream_ctrl_log_stats(sdev);
     }
+
     mutex_unlock(&sdev->io_lock);
 
     return 0;
 }
 
 /* 按顺序领取已完成的数据包，复制给用户后归还缓冲区。 */
-static ssize_t stream_ctrl_file_read(struct file *filp, char __user *buf,
+static ssize_t stream_ctrl_file_read(struct file *filp, char __user *user_buf,
                                      size_t count, loff_t *ppos)
 {
-    int ret;
     struct stream_ctrl_dev *sdev;
+    struct stream_rx_buffer *rx_buffer;
     enum stream_rx_state rx_state;
     unsigned long flags;
-    struct stream_rx_buffer *rx_buffer;
+    int ret;
 
     sdev = filp->private_data;
 
-    if (count == 0) return 0;
-    if (count < STREAM_RX_BUF_SIZE) return -EMSGSIZE;
+    if (count == 0)
+        return 0;
+    if (count < STREAM_RX_BUF_SIZE)
+        return -EMSGSIZE;
 
+    /* io_lock 串行化读取；非阻塞模式拿不到锁就立即返回。 */
     if (filp->f_flags & O_NONBLOCK) {
-        if (!mutex_trylock(&sdev->io_lock)) return -EAGAIN;
+        if (!mutex_trylock(&sdev->io_lock))
+            return -EAGAIN;
     } else {
         ret = mutex_lock_interruptible(&sdev->io_lock);
-        if (ret) return ret;
+        if (ret)
+            return ret;
     }
 
     for (;;) {
         spin_lock_irqsave(&sdev->state_lock, flags);
         rx_state = sdev->rx_state;
         if (rx_state == STREAM_RX_FAULT || rx_state == STREAM_RX_CANCELLED) {
-            ret = (rx_state == STREAM_RX_FAULT) ? -EIO : -ECANCELED;
+            if (rx_state == STREAM_RX_FAULT)
+                ret = -EIO;
+            else
+                ret = -ECANCELED;
+
             spin_unlock_irqrestore(&sdev->state_lock, flags);
             goto out_unlock;
         }
@@ -460,6 +476,7 @@ static ssize_t stream_ctrl_file_read(struct file *filp, char __user *buf,
             goto out_unlock;
         }
 
+        /* 等数据前已释放 state_lock，回调才能更新状态。 */
         ret = stream_ctrl_wait_rx(sdev);
         if (ret)
             goto out_unlock;
@@ -469,7 +486,8 @@ static ssize_t stream_ctrl_file_read(struct file *filp, char __user *buf,
     if (ret)
         goto out_free_buffer;
 
-    if (copy_to_user(buf, rx_buffer->cpu_addr, STREAM_RX_BUF_SIZE))
+    /* 用户内存访问可能睡眠，不能放在 state_lock 内。 */
+    if (copy_to_user(user_buf, rx_buffer->cpu_addr, STREAM_RX_BUF_SIZE))
         ret = -EFAULT;
     else
         ret = STREAM_RX_BUF_SIZE;
@@ -494,13 +512,15 @@ out_unlock:
     return ret;
 }
 
-/* 注册等待队列，报告数据可读或错误事件。 */
+/* 登记等待关系，只报告可读或错误状态。 */
 static __poll_t stream_ctrl_poll(struct file *filp, poll_table *wait)
 {
     struct stream_ctrl_dev *sdev;
     enum stream_rx_state rx_state;
 
     sdev = filp->private_data;
+
+    /* 这里只登记通知，睡眠由内核 poll 框架处理。 */
     poll_wait(filp, &sdev->rx_wait, wait);
 
     rx_state = stream_ctrl_get_rx_state(sdev);
@@ -515,29 +535,29 @@ static __poll_t stream_ctrl_poll(struct file *filp, poll_table *wait)
 }
 
 static struct file_operations stream_ctrl_fops = {
-    .owner = THIS_MODULE,
-    .open = stream_ctrl_open,
+    .owner   = THIS_MODULE,
+    .open    = stream_ctrl_open,
     .release = stream_ctrl_release,
-    .read = stream_ctrl_file_read,
-    .llseek = no_llseek,
-    .poll = stream_ctrl_poll
+    .read    = stream_ctrl_file_read,
+    .llseek  = no_llseek,
+    .poll    = stream_ctrl_poll,
 };
 
 /* 释放已分配的 DMA 缓冲区内存。 */
 static void stream_ctrl_free_buffers(struct stream_ctrl_dev *sdev)
 {
-    unsigned int i;
     struct device *dma_chan_dev;
+    struct stream_rx_buffer *buf;
+    unsigned int i;
 
     dma_chan_dev = sdev->rx_channel->device->dev;
 
     for (i = 0; i < STREAM_RX_BUF_COUNT; i++) {
-        if (sdev->rx_buffers[i].cpu_addr != NULL) {
-            dma_free_coherent(dma_chan_dev,
-                              sdev->rx_buffers[i].size,
-                              sdev->rx_buffers[i].cpu_addr,
-                              sdev->rx_buffers[i].dma_addr);
-            sdev->rx_buffers[i].cpu_addr = NULL;
+        buf = &sdev->rx_buffers[i];
+        if (buf->cpu_addr) {
+            dma_free_coherent(dma_chan_dev, buf->size,
+                              buf->cpu_addr, buf->dma_addr);
+            buf->cpu_addr = NULL;
         }
     }
 }
@@ -559,15 +579,14 @@ static int stream_ctrl_alloc_buffers(struct stream_ctrl_dev *sdev)
         buf->state = STREAM_BUF_FREE;
         buf->cookie = 0;
 
-        buf->cpu_addr = dma_alloc_coherent(dma_chan_dev,
-                                           STREAM_RX_BUF_SIZE,
-                                           &buf->dma_addr,
-                                           GFP_KERNEL);
-        if (buf->cpu_addr == NULL) {
+        buf->cpu_addr = dma_alloc_coherent(dma_chan_dev, STREAM_RX_BUF_SIZE,
+                                           &buf->dma_addr, GFP_KERNEL);
+        if (!buf->cpu_addr) {
             stream_ctrl_free_buffers(sdev);
             return -ENOMEM;
         }
     }
+
     return 0;
 }
 
@@ -579,17 +598,15 @@ static int stream_ctrl_probe(struct platform_device *pdev)
     u32 version;
     int ret;
 
-    /* devm_kzalloc() 会把 sdev 的生命周期绑定到 platform device。 */
+    /* 设备私有数据由 devm 管理。 */
     sdev = devm_kzalloc(&pdev->dev, sizeof(*sdev), GFP_KERNEL);
     if (!sdev)
         return -ENOMEM;
 
     sdev->dev = &pdev->dev;
-
-    /* 初始化读写路径使用的互斥锁。 */
     mutex_init(&sdev->io_lock);
 
-    /* 获取并映射 stream_gen 的 MMIO 资源。 */
+    /* 映射发生器寄存器，并检查硬件版本。 */
     res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
     if (!res) {
         dev_err(&pdev->dev, "stream_ctrl: failed to get MEM resource\n");
@@ -613,10 +630,10 @@ static int stream_ctrl_probe(struct platform_device *pdev)
         return -ENODEV;
     }
 
-    /* 保存 sdev，使 remove() 和后续驱动操作可以取得设备私有数据。 */
+    /* 保存设备指针，供 remove() 使用。 */
     platform_set_drvdata(pdev, sdev);
 
-    /* 根据设备树中的 "rx" 名称申请 DMAEngine 接收 channel。 */
+    /* 按设备树中的 rx 名称申请 DMA 通道，再分配缓冲区。 */
     sdev->rx_channel = dma_request_chan(&pdev->dev, "rx");
     if (IS_ERR(sdev->rx_channel)) {
         ret = PTR_ERR(sdev->rx_channel);
@@ -644,6 +661,7 @@ static int stream_ctrl_probe(struct platform_device *pdev)
              "stream_ctrl: allocated %u RX buffers, %zu bytes each\n",
              STREAM_RX_BUF_COUNT, sdev->rx_buffers[0].size);
 
+    /* 发布字符设备入口。 */
     cdev_init(&sdev->cdev, &stream_ctrl_fops);
     sdev->cdev.owner = THIS_MODULE;
     ret = cdev_add(&sdev->cdev, stream_dev_num, 1);
@@ -652,7 +670,8 @@ static int stream_ctrl_probe(struct platform_device *pdev)
         goto err_free_dma;
     }
 
-    sdev->dev_node = device_create(stream_class, &pdev->dev, stream_dev_num, sdev, "zynq_stream0");
+    sdev->dev_node = device_create(stream_class, &pdev->dev,
+                                   stream_dev_num, sdev, "zynq_stream0");
     if (IS_ERR(sdev->dev_node)) {
         ret = PTR_ERR(sdev->dev_node);
         dev_err(&pdev->dev, "device_create failed: %d\n", ret);
@@ -695,12 +714,12 @@ static int stream_ctrl_remove(struct platform_device *pdev)
         stream_ctrl_hw_reset(sdev);
     }
 
-    /* 只有 DMA 不再访问 buffer 后，才能释放 coherent 内存。 */
+    /* 释放内存的前提是 DMA 和回调已不再访问它。 */
     if (sdev && sdev->rx_channel) {
         stream_ctrl_free_buffers(sdev);
     }
 
-    /* 释放 DMA 可见的 buffer 后，再释放 DMA channel。 */
+    /* 缓冲区释放后，再归还 DMA 通道。 */
     if (sdev && sdev->rx_channel) {
         dma_release_channel(sdev->rx_channel);
         sdev->rx_channel = NULL;
@@ -744,10 +763,10 @@ static const struct of_device_id stream_ctrl_of_match[] = {
 MODULE_DEVICE_TABLE(of, stream_ctrl_of_match);
 
 static struct platform_driver stream_ctrl_driver = {
-    .probe = stream_ctrl_probe,
+    .probe  = stream_ctrl_probe,
     .remove = stream_ctrl_remove,
     .driver = {
-        .name = STREAM_CTRL_DRV_NAME,
+        .name           = STREAM_CTRL_DRV_NAME,
         .of_match_table = stream_ctrl_of_match,
     }
 };
@@ -780,6 +799,7 @@ static int __init stream_ctrl_init(void)
         unregister_chrdev_region(stream_dev_num, 1);
         return ret;
     }
+
     return 0;
 }
 
