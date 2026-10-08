@@ -19,4 +19,10 @@ struct stream_rx_stats {
 #define STREAM_IOC_GET_STATS \
     _IOR('Z', 1, struct stream_rx_stats)
 
+/* 清零接收统计。 */
+#define STREAM_IOC_CLR_STATS _IO('Z', 2)
+
+/* 设置发送间隔，参数由用户传入。 */
+#define STREAM_IOC_SET_RATE _IOW('Z', 3, __u32)
+
 #endif

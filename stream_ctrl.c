@@ -33,11 +33,18 @@ static void stream_ctrl_write(struct stream_ctrl_dev *sdev, u32 reg, u32 value)
 static void stream_ctrl_prepare_rx(struct stream_rx_buffer *buf)
 {
     struct stream_ctrl_dev *sdev = buf->sdev;
+    u32 rate_div;
+    unsigned long flags;
 
     stream_ctrl_hw_stop(sdev);
     stream_ctrl_hw_reset(sdev);
     stream_ctrl_write(sdev, STREAM_REG_PACKET_LEN, STREAM_RX_WORDS);
-    stream_ctrl_write(sdev, STREAM_REG_RATE_DIV, 1000);
+
+    spin_lock_irqsave(&sdev->state_lock, flags);
+    rate_div = sdev->rate_div;
+    spin_unlock_irqrestore(&sdev->state_lock, flags);
+
+    stream_ctrl_write(sdev, STREAM_REG_RATE_DIV, rate_div);
 
     /* 正常接收后，0xA5 应被整包数据覆盖。 */
     memset(buf->cpu_addr, 0xA5, buf->size);
@@ -534,30 +541,52 @@ static __poll_t stream_ctrl_poll(struct file *filp, poll_table *wait)
     return 0;
 }
 
-/* 处理控制命令，返回接收统计。 */
+/* 处理接收统计和发送间隔配置。 */
 static long stream_ctrl_ioctl(struct file *filp,
                               unsigned int cmd,
                               unsigned long arg)
 {
     struct stream_ctrl_dev *sdev;
     struct stream_rx_stats stats;
+    u32 rate_div;
     unsigned long flags;
     int ret;
 
     sdev = filp->private_data;
 
-    if (cmd != STREAM_IOC_GET_STATS)
+    switch (cmd) {
+    case STREAM_IOC_CLR_STATS:
+        spin_lock_irqsave(&sdev->state_lock, flags);
+        memset(&sdev->stats, 0, sizeof(sdev->stats));
+        spin_unlock_irqrestore(&sdev->state_lock, flags);
+        return 0;
+
+    case STREAM_IOC_GET_STATS:
+        spin_lock_irqsave(&sdev->state_lock, flags);
+        stats = sdev->stats;
+        spin_unlock_irqrestore(&sdev->state_lock, flags);
+
+        ret = copy_to_user((void __user *)arg, &stats, sizeof(stats));
+        if (ret != 0)
+            return -EFAULT;
+        return 0;
+
+    case STREAM_IOC_SET_RATE:
+        ret = copy_from_user(&rate_div, (void __user *)arg, sizeof(rate_div));
+        if (ret)
+            return -EFAULT;
+        if (rate_div > STREAM_RATE_DIV_MAX)
+            return -EINVAL;
+
+        spin_lock_irqsave(&sdev->state_lock, flags);
+        sdev->rate_div = rate_div;
+        spin_unlock_irqrestore(&sdev->state_lock, flags);
+
+        return 0;
+
+    default:
         return -ENOTTY;
-
-    spin_lock_irqsave(&sdev->state_lock, flags);
-    stats = sdev->stats;
-    spin_unlock_irqrestore(&sdev->state_lock, flags);
-
-    ret = copy_to_user((void __user *)arg, &stats, sizeof(stats));
-    if (ret != 0)
-        return -EFAULT;
-
-    return 0;
+    }
 }
 
 static struct file_operations stream_ctrl_fops = {
@@ -629,6 +658,8 @@ static int stream_ctrl_probe(struct platform_device *pdev)
     sdev = devm_kzalloc(&pdev->dev, sizeof(*sdev), GFP_KERNEL);
     if (!sdev)
         return -ENOMEM;
+
+    sdev->rate_div = STREAM_RATE_DIV_DEFAULT;
 
     sdev->dev = &pdev->dev;
     mutex_init(&sdev->io_lock);

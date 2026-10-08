@@ -43,6 +43,9 @@
 #define STREAM_RX_BUF_SIZE     (STREAM_RX_WORDS * sizeof(u32))
 #define STREAM_RX_BUF_COUNT    4U
 
+#define STREAM_RATE_DIV_DEFAULT 1000U
+#define STREAM_RATE_DIV_MAX     1000000U
+
 struct dma_chan;
 struct stream_ctrl_dev;
 
@@ -88,7 +91,7 @@ struct stream_ctrl_dev {
 
     wait_queue_head_t rx_wait; /* read 和 poll 共用的通知队列。 */
     enum stream_rx_state rx_state;
-    spinlock_t state_lock;   /* 保护接收状态、缓冲区状态、索引和统计。 */
+    spinlock_t state_lock;   /* 保护接收状态、缓冲区、索引、配置和统计。 */
     struct work_struct rx_work; /* 由工作线程执行的接收任务。 */
 
     unsigned int open_count; /* 由 io_lock 保护的打开计数。 */
@@ -102,6 +105,8 @@ struct stream_ctrl_dev {
     unsigned int rx_read_index;
 
     struct stream_rx_buffer rx_buffers[STREAM_RX_BUF_COUNT];
+
+    u32 rate_div; /* 后续接收使用的发送间隔，由 state_lock 保护。 */
 };
 
 /* 启动发生器发送一包数据。 */

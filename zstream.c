@@ -14,8 +14,8 @@
 #define PKT_WORDS  16
 #define PKT_SIZE   (PKT_WORDS * 4)
 
-/* 解析正整数参数，格式或范围错误时返回 -1。 */
-static int parse_positive(const char *text)
+/* 解析非负整数参数，格式或范围错误时返回 -1。 */
+static int parse_nonnegative(const char *text)
 {
     char *end;
     long value;
@@ -23,7 +23,7 @@ static int parse_positive(const char *text)
     errno = 0;
     value = strtol(text, &end, 10);
     if (errno != 0 || end == text || *end != '\0' ||
-        value <= 0 || value > INT_MAX)
+        value < 0 || value > INT_MAX)
         return -1;
 
     return (int)value;
@@ -56,14 +56,17 @@ static int verify_packet(const unsigned char *buf, unsigned int packet)
     return 0;
 }
 
-/* 按包数接收数据，按需校验，结束前查询驱动统计。 */
+/* 按包数接收并按需校验，结束前查询统计并按需清零。 */
 int main(int argc, char *argv[])
 {
     unsigned char buf[PKT_SIZE];
     struct pollfd pfd;
     struct stream_rx_stats stats;
+    int clear_stats = 0;
+    int clear_ret = 0;
     int stats_ret = 0;
     int count = 1;
+    int rate = -1;          /* 未指定时沿用驱动当前的发送间隔。 */
     int verify = 0;
     int poll_mode = 0;
     int open_flags = O_RDONLY;
@@ -77,11 +80,17 @@ int main(int argc, char *argv[])
     /* 解析运行参数。 */
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--count") == 0 && i + 1 < argc) {
-            count = parse_positive(argv[++i]);
+            count = parse_nonnegative(argv[++i]);
+        } else if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc) {
+            rate = parse_nonnegative(argv[++i]);
+            if (rate < 0)
+                goto usage;
         } else if (strcmp(argv[i], "--verify") == 0) {
             verify = 1;
         } else if (strcmp(argv[i], "--poll") == 0) {
             poll_mode = 1;
+        } else if (strcmp(argv[i], "--clear-stats") == 0) {
+            clear_stats = 1;
         } else {
             goto usage;
         }
@@ -98,6 +107,18 @@ int main(int argc, char *argv[])
     if (fd < 0) {
         perror("open " DEV_PATH);
         return 1;
+    }
+
+    /* 在首次 read 启动接收前设置参数，允许 rate 为 0。 */
+    if (rate >= 0) {
+        __u32 rate_div = (__u32)rate;
+
+        if (ioctl(fd, STREAM_IOC_SET_RATE, &rate_div) < 0) {
+            perror("ioctl SET_RATE");
+            if (close(fd) < 0)
+                perror("close");
+            return 1;
+        }
     }
 
     pfd.fd = fd;
@@ -163,6 +184,15 @@ int main(int argc, char *argv[])
                (unsigned long long)stats.read_packets);
     }
 
+    /* 清零不停止接收，后续完成的 DMA 仍会增加计数。 */
+    if (clear_stats) {
+        clear_ret = ioctl(fd, STREAM_IOC_CLR_STATS, 0);
+        if (clear_ret < 0)
+            perror("ioctl CLR_STATS");
+        else
+            printf("driver stats cleared\n");
+    }
+
     /* 关闭设备结束本轮接收，再输出用户态统计。 */
     if (close(fd) < 0) {
         perror("close");
@@ -172,12 +202,14 @@ int main(int argc, char *argv[])
     printf("success=%u data_error=%u read_error=%u\n",
            packets - data_err_cnt, data_err_cnt, read_err_cnt);
 
-    if (data_err_cnt || read_err_cnt || stats_ret < 0)
+    if (data_err_cnt || read_err_cnt || stats_ret < 0 || clear_ret < 0)
         return 1;
     return 0;
 
 usage:
-    fprintf(stderr, "Usage: %s [--poll] [--count N] [--verify]\n",
+    fprintf(stderr,
+            "Usage: %s [--poll] [--count N] [--rate N] [--verify] [--clear-stats]\n"
+            "  --rate N: FPGA wait cycles (0 means no extra delay).\n",
             argv[0]);
     return 1;
 }
