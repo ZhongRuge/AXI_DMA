@@ -7,8 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "stream_ctrl_uapi.h"
 
 #define DEV_PATH   "/dev/zynq_stream0"
 #define PKT_WORDS  16
@@ -35,6 +38,8 @@ int main(int argc, char *argv[])
     unsigned char buf[PKT_SIZE];
     struct timespec start, now;
     struct pollfd pfd;
+    struct stream_rx_stats stats;
+    int stats_ret = 0;
     int count = 1;
     int seconds = 0;
     int count_set = 0;
@@ -196,6 +201,15 @@ int main(int argc, char *argv[])
             data_err_cnt++;
     }
 
+    stats_ret = ioctl(fd, STREAM_IOC_GET_STATS, &stats);
+    if (stats_ret < 0) {
+        perror("ioctl GET_STATS");
+    } else {
+        printf("driver: rx_packets=%llu read_packets=%llu\n",
+               (unsigned long long)stats.rx_packets,
+               (unsigned long long)stats.read_packets);
+    }
+
     /* 关闭设备结束本轮接收，再输出用户态统计。 */
     if (close(fd) < 0) {
         perror("close");
@@ -210,7 +224,7 @@ int main(int argc, char *argv[])
         printf("first data error: packet=%u word=%d expected=%u actual=%u\n",
                first_err_packet, first_err_word, first_expected, first_actual);
 
-    if (data_err_cnt || read_err_cnt)
+    if (data_err_cnt || read_err_cnt || stats_ret < 0)
         return 1;
     return 0;
 

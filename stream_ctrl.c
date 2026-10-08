@@ -534,13 +534,40 @@ static __poll_t stream_ctrl_poll(struct file *filp, poll_table *wait)
     return 0;
 }
 
+/* 处理控制命令，返回接收统计。 */
+static long stream_ctrl_ioctl(struct file *filp,
+                              unsigned int cmd,
+                              unsigned long arg)
+{
+    struct stream_ctrl_dev *sdev;
+    struct stream_rx_stats stats;
+    unsigned long flags;
+    int ret;
+
+    sdev = filp->private_data;
+
+    if (cmd != STREAM_IOC_GET_STATS)
+        return -ENOTTY;
+
+    spin_lock_irqsave(&sdev->state_lock, flags);
+    stats = sdev->stats;
+    spin_unlock_irqrestore(&sdev->state_lock, flags);
+
+    ret = copy_to_user((void __user *)arg, &stats, sizeof(stats));
+    if (ret != 0)
+        return -EFAULT;
+
+    return 0;
+}
+
 static struct file_operations stream_ctrl_fops = {
-    .owner   = THIS_MODULE,
-    .open    = stream_ctrl_open,
-    .release = stream_ctrl_release,
-    .read    = stream_ctrl_file_read,
-    .llseek  = no_llseek,
-    .poll    = stream_ctrl_poll,
+    .owner          = THIS_MODULE,
+    .open           = stream_ctrl_open,
+    .release        = stream_ctrl_release,
+    .read           = stream_ctrl_file_read,
+    .llseek         = no_llseek,
+    .poll           = stream_ctrl_poll,
+    .unlocked_ioctl = stream_ctrl_ioctl,
 };
 
 /* 释放已分配的 DMA 缓冲区内存。 */
