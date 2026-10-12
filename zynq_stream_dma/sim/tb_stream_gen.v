@@ -1,5 +1,7 @@
 `timescale 1ns / 1ps
 
+// 早期连续输出版本的仿真参考；当前 RTL 一次 ENABLE 只发送一包。
+// 下方测试 3 仍期待一次启动输出两包，使用前需按单包语义更新。
 module tb_stream_gen;
 
 localparam [4:0] REG_CTRL               = 5'h00;
@@ -76,6 +78,7 @@ stream_gen dut (
 
 always #5 s_axi_aclk = ~s_axi_aclk;
 
+// 比较 32 位值并累计失败次数。
 task check32;
     input [127:0] label;
     input [31:0]  actual;
@@ -90,6 +93,7 @@ task check32;
     end
 endtask
 
+// 比较单个信号位并累计失败次数。
 task check1;
     input [127:0] label;
     input         actual;
@@ -104,6 +108,7 @@ task check1;
     end
 endtask
 
+// 模拟 PS 写寄存器，等待地址、数据及响应握手。
 task axi_write;
     input [4:0]  address;
     input [31:0] data;
@@ -164,6 +169,7 @@ task axi_write;
     end
 endtask
 
+// 模拟 PS 读寄存器，等待地址及数据握手。
 task axi_read;
     input  [4:0]  address;
     output [31:0] data;
