@@ -7,7 +7,7 @@
 
 /* 包长单位为 32 位数，范围由当前接收缓冲区容量限定。 */
 #define STREAM_PKT_WORDS_DEFAULT 16U
-#define STREAM_PKT_WORDS_MAX     16U
+#define STREAM_PKT_WORDS_MAX     4096U
 
 /* 驱动与用户程序共用的接收统计。 */
 struct stream_rx_stats {
@@ -18,6 +18,38 @@ struct stream_rx_stats {
     __u64 full_pauses;       /* 缓冲区满导致的暂停次数。 */
     __u64 errors;            /* 提交、状态检查、复制和停止错误。 */
     __u64 timeouts;          /* 阻塞 read 或正常 STOP 等待超时。 */
+};
+
+/* 分段计时记录经过时间，可能包含抢占/等待；重叠的行不能相加。 */
+struct stream_timing_sample {
+    __u64 count;
+    __u64 total_ns;
+    __u64 max_ns;
+};
+
+enum stream_profile_stage {
+    STREAM_PROFILE_HW_CONFIG,        /* 包间复位及按需更新发生器参数。 */
+    STREAM_PROFILE_BUFFER_FILL,      /* 接收区域填充 0xA5。 */
+    STREAM_PROFILE_DMA_PREP,          /* 准备描述符及回调。 */
+    STREAM_PROFILE_DMA_SUBMIT,       /* 提交描述符，预备包也计入。 */
+    STREAM_PROFILE_DMA_ISSUE,         /* issue_pending 调用，不是搬运全程。 */
+    STREAM_PROFILE_START_WRITE,       /* 写发生器启动寄存器。 */
+    STREAM_PROFILE_START_TO_CALLBACK, /* 启动前到有效回调入口，取消不计。 */
+    STREAM_PROFILE_CALLBACK_BODY,    /* 回调入口到唤醒结束，含内部日志。 */
+    STREAM_PROFILE_READY_TO_NEXT_RX, /* 上包 READY 到下包启动，含等待预备和满暂停。 */
+    STREAM_PROFILE_READY_TO_READ,     /* 本包 READY 到 read 领取，丢弃包不计。 */
+    STREAM_PROFILE_DMA_STATUS,        /* 查询 cookie 的完成状态。 */
+    STREAM_PROFILE_COPY_TO_USER,      /* 复制到用户内存，含可能的缺页等待。 */
+    STREAM_PROFILE_TRACE_WRITE,       /* 持锁后写一条日志，嵌套在其他阶段中。 */
+    STREAM_PROFILE_FULL_PAUSE,        /* 缺空闲缓冲区到恢复领取或停止。 */
+    STREAM_PROFILE_STAGE_COUNT,
+};
+
+/* 第一个控制句柄打开时清零；GET 只取副本，包含收尾丢弃包的活动。 */
+struct stream_profile_stats {
+    __u32 enabled;
+    __u32 reserved;
+    struct stream_timing_sample stages[STREAM_PROFILE_STAGE_COUNT];
 };
 
 /* 诊断记录按事件计数；一包数据会产生多条事件。 */
@@ -79,7 +111,7 @@ struct stream_trace_error {
     __s32 error;            /* 负 errno。 */
 };
 
-/* O_RDONLY 仅支持 GET_STATS/GET_TRACE；接收及修改操作须用 O_RDWR 打开。 */
+/* O_RDONLY 仅支持三个 GET 查询；接收及修改操作须用 O_RDWR 打开。 */
 #define STREAM_IOC_GET_STATS \
     _IOR('Z', 1, struct stream_rx_stats)
 #define STREAM_IOC_CLR_STATS _IO('Z', 2)
@@ -100,5 +132,8 @@ struct stream_trace_error {
 #define STREAM_IOC_FREEZE_TRACE _IOW('Z', 10, struct stream_trace_error)
 /* 原子检查并清理普通历史；已冻结时返回 EALREADY，不改动记录。 */
 #define STREAM_IOC_PREP_TRACE _IO('Z', 11)
+
+/* 分段计时由加载模块时的 profile=1 启用；此接口不改变运行状态。 */
+#define STREAM_IOC_GET_PROFILE _IOR('Z', 12, struct stream_profile_stats)
 
 #endif

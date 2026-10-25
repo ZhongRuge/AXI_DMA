@@ -1,4 +1,6 @@
 /* 用户态主线：解析参数 -> open -> 配置/START -> 接收校验 -> STOP -> close。 */
+#define _POSIX_C_SOURCE 200809L
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -7,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "stream_ctrl_uapi.h"
@@ -29,7 +32,120 @@ struct program_options {
     int packet_words;
     int rate_div;            /* -1 表示沿用驱动当前配置。 */
     int blocking;
+    int verify;              /* 默认校验，可关闭以测量校验开销。 */
 };
+
+/* 用户侧的调用耗时，含返回错误/EAGAIN 的调用；profile 开启时采集。 */
+struct user_profile {
+    int enabled;
+    int failed;
+    struct stream_timing_sample read_calls;
+    struct stream_timing_sample poll_calls;
+    struct stream_timing_sample verify_calls;
+};
+
+/* 两个单调时间点相减，纳秒部分换算成秒。 */
+static double elapsed_seconds(const struct timespec *begin,
+                              const struct timespec *end)
+{
+    return (double)(end->tv_sec - begin->tv_sec) +
+           (double)(end->tv_nsec - begin->tv_nsec) / 1000000000.0;
+}
+
+/* 取得纳秒时间戳；计时失败只停止采集，不打断接收和清理。 */
+static __u64 user_profile_now(struct user_profile *timings)
+{
+    struct timespec now;
+
+    if (!timings->enabled || timings->failed)
+        return 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+        perror("clock_gettime PROFILE");
+        timings->failed = 1;
+        return 0;
+    }
+    return (__u64)now.tv_sec * 1000000000ULL + now.tv_nsec;
+}
+
+/* 累加调用耗时，保留刚刚 read/poll 返回的 errno。 */
+static void user_profile_finish(struct user_profile *timings,
+                                struct stream_timing_sample *sample,
+                                __u64 begin_ns)
+{
+    int saved_errno = errno;
+    __u64 end_ns;
+    __u64 elapsed_ns;
+
+    if (!begin_ns)
+        return;
+    end_ns = user_profile_now(timings);
+    if (!timings->failed && end_ns >= begin_ns) {
+        elapsed_ns = end_ns - begin_ns;
+        sample->count++;
+        sample->total_ns += elapsed_ns;
+        if (elapsed_ns > sample->max_ns)
+            sample->max_ns = elapsed_ns;
+    }
+    errno = saved_errno;
+}
+
+/* 将纳秒汇总换算成总毫秒、平均微秒及最大微秒。 */
+static void print_timing_row(const char *name,
+                             const struct stream_timing_sample *sample)
+{
+    double average_us = 0.0;
+
+    if (sample->count)
+        average_us = (double)sample->total_ns / sample->count / 1000.0;
+    printf("%-22s %8llu %10.3f %10.3f %10.3f\n",
+           name, (unsigned long long)sample->count,
+           sample->total_ns / 1000000.0, average_us, sample->max_ns / 1000.0);
+}
+
+/* STOP 后打印两侧的汇总；各行会重叠，不能相加成接收总时间。 */
+static int print_profile(int fd, const struct user_profile *timings)
+{
+    static const char *const names[STREAM_PROFILE_STAGE_COUNT] = {
+        [STREAM_PROFILE_HW_CONFIG] = "drv.hw_config",
+        [STREAM_PROFILE_BUFFER_FILL] = "drv.buffer_fill",
+        [STREAM_PROFILE_DMA_PREP] = "drv.dma_prep",
+        [STREAM_PROFILE_DMA_SUBMIT] = "drv.dma_submit",
+        [STREAM_PROFILE_DMA_ISSUE] = "drv.dma_issue",
+        [STREAM_PROFILE_START_WRITE] = "drv.start_write",
+        [STREAM_PROFILE_START_TO_CALLBACK] = "drv.start_to_callback",
+        [STREAM_PROFILE_CALLBACK_BODY] = "drv.callback_body",
+        [STREAM_PROFILE_READY_TO_NEXT_RX] = "drv.ready_to_next_start",
+        [STREAM_PROFILE_READY_TO_READ] = "drv.ready_to_read",
+        [STREAM_PROFILE_DMA_STATUS] = "drv.dma_status",
+        [STREAM_PROFILE_COPY_TO_USER] = "drv.copy_to_user",
+        [STREAM_PROFILE_TRACE_WRITE] = "drv.trace_write",
+        [STREAM_PROFILE_FULL_PAUSE] = "drv.full_pause",
+    };
+    struct stream_profile_stats stats;
+    unsigned int i;
+
+    if (ioctl(fd, STREAM_IOC_GET_PROFILE, &stats) < 0) {
+        perror("ioctl GET_PROFILE");
+        return -1;
+    }
+
+    printf("profile: elapsed time, includes waits/preemption; not CPU time\n");
+    printf("Rows overlap; driver samples include packets discarded at STOP.\n");
+    printf("Only finished intervals are counted; calls may include failures.\n");
+    printf("%-22s %8s %10s %10s %10s\n",
+           "stage", "count", "total_ms", "avg_us", "max_us");
+    for (i = 0; i < STREAM_PROFILE_STAGE_COUNT; i++)
+        print_timing_row(names[i], &stats.stages[i]);
+
+    if (timings->failed) {
+        fprintf(stderr, "userspace profile unavailable: clock read failed\n");
+        return -1;
+    }
+    print_timing_row("user.read", &timings->read_calls);
+    print_timing_row("user.poll", &timings->poll_calls);
+    print_timing_row("user.verify", &timings->verify_calls);
+    return 0;
+}
 
 /* 把事件编号转换成便于阅读的名称。 */
 static const char *trace_event_name(unsigned int event)
@@ -200,6 +316,8 @@ static int parse_options(int argc, char *argv[], struct program_options *options
                     return -1;
             } else if (strcmp(argv[i], "--blocking") == 0) {
                 options->blocking = 1;
+            } else if (strcmp(argv[i], "--no-verify") == 0) {
+                options->verify = 0;
             } else if (argv[i][0] != '-' && !count_set) {
                 options->packet_count = parse_nonnegative(argv[i]);
                 count_set = 1;
@@ -219,13 +337,15 @@ static int parse_options(int argc, char *argv[], struct program_options *options
 static void print_usage(const char *program)
 {
     fprintf(stderr,
-            "Usage: %s [count] [--pkt-len N] [--rate N] [--blocking]\n"
+            "Usage: %s [count] [--pkt-len N] [--rate N] [--blocking] [--no-verify]\n"
             "       %s trace\n"
             "       %s reset\n"
             "  Default: receive %d packets with poll and verify every packet.\n"
             "  --pkt-len N: 32-bit words per packet (1..%u, default %u).\n"
             "  --rate N: FPGA wait cycles (0 means no extra delay).\n"
             "  --blocking: use blocking read instead of poll.\n"
+            "  --no-verify: skip content checks for a throughput comparison.\n"
+            "  Stage timings: load stream_ctrl.ko with profile=1.\n"
             "  trace: view saved history without starting reception.\n"
             "  reset: reset reception and discard saved history; do not start.\n",
             program, program, program, DEFAULT_COUNT,
@@ -233,18 +353,24 @@ static void print_usage(const char *program)
 }
 
 /* 读出一整包；EAGAIN 时用 poll 等通知，再重新 read。 */
-static int receive_packet(int fd, unsigned char *buf, size_t size, int blocking)
+static int receive_packet(int fd, unsigned char *buf, size_t size, int blocking,
+                           struct user_profile *timings)
 {
     struct pollfd pfd = { .fd = fd, .events = POLLIN };
     ssize_t n;
+    __u64 begin_ns;
 
     for (;;) {
+        begin_ns = user_profile_now(timings);
         n = read(fd, buf, size);
+        user_profile_finish(timings, &timings->read_calls, begin_ns);
         if (n < 0 && errno == EAGAIN && !blocking) {
             int poll_ret;
 
             pfd.revents = 0;
+            begin_ns = user_profile_now(timings);
             poll_ret = poll(&pfd, 1, POLL_TIMEOUT_MS);
+            user_profile_finish(timings, &timings->poll_calls, begin_ns);
             if (poll_ret < 0) {
                 int error = errno;
 
@@ -291,17 +417,26 @@ int main(int argc, char *argv[])
 {
     unsigned char buf[PKT_BUF_SIZE];
     size_t packet_size;
+    struct timespec start_time;
+    struct timespec receive_end_time;
+    struct timespec stop_end_time;
     struct stream_rx_stats stats;
+    struct stream_profile_stats driver_profile;
+    struct user_profile timings = {0};
     struct program_options options = {
         .command = COMMAND_RECEIVE,
         .packet_count = DEFAULT_COUNT,
         .packet_words = STREAM_PKT_WORDS_DEFAULT,
         .rate_div = -1,
         .blocking = 0,
+        .verify = 1,
     };
     int stats_ret = 0;
     int stop_ret = 0;
+    int stop_errno;
     int trace_ret = 0;
+    int profile_ret = 0;
+    int timing_error = 0;
     int open_flags;
     int fd;
 
@@ -351,6 +486,13 @@ int main(int argc, char *argv[])
     if (prepare_trace(fd) < 0)
         goto startup_error;
 
+    /* 开关由模块决定，用户侧与驱动侧使用同一轮计时口径。 */
+    if (ioctl(fd, STREAM_IOC_GET_PROFILE, &driver_profile) < 0) {
+        perror("ioctl GET_PROFILE");
+        goto startup_error;
+    }
+    timings.enabled = driver_profile.enabled;
+
     /* 每次明确设置包长，未指定时使用默认值，保证收发双方长度一致。 */
     {
         __u32 words = (__u32)options.packet_words;
@@ -371,6 +513,12 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* T0：计时从 START 前开始，包含启动、接收和校验。 */
+    if (clock_gettime(CLOCK_MONOTONIC, &start_time) < 0) {
+        perror("clock_gettime START");
+        goto startup_error;
+    }
+
     /* START 请求驱动安排接收任务，数据是否就绪仍由 read/poll 判断。 */
     if (ioctl(fd, STREAM_IOC_START, 0) < 0) {
         perror("ioctl START");
@@ -379,24 +527,45 @@ int main(int argc, char *argv[])
 
     /* 这里直接表达接收目标：取一包、计数、校验，重复到指定包数。 */
     while (packets < (unsigned int)options.packet_count) {
-        if (receive_packet(fd, buf, packet_size, options.blocking) < 0) {
+        if (receive_packet(fd, buf, packet_size, options.blocking, &timings) < 0) {
             read_err_cnt++;
             break;
         }
 
-        /* 收到整包才计数；校验失败时立即结束本轮接收。 */
+        /* 收到整包才计数；启用校验时，数据错误立即结束本轮接收。 */
         packets++;
-        if (verify_packet(buf, options.packet_words, packets) < 0) {
-            freeze_trace(fd, STREAM_TRACE_USER_DATA_ERROR, -EBADMSG);
-            data_err_cnt++;
-            break;
+        if (options.verify) {
+            __u64 begin_ns = user_profile_now(&timings);
+            int verify_ret = verify_packet(buf, options.packet_words, packets);
+
+            user_profile_finish(&timings, &timings.verify_calls, begin_ns);
+            if (verify_ret < 0) {
+                freeze_trace(fd, STREAM_TRACE_USER_DATA_ERROR, -EBADMSG);
+                data_err_cnt++;
+                break;
+            }
         }
+    }
+
+    /* T1：接收循环结束；STOP 的收尾时间单独计算。 */
+    if (clock_gettime(CLOCK_MONOTONIC, &receive_end_time) < 0) {
+        perror("clock_gettime RECEIVE_END");
+        timing_error = 1;
     }
 
     /* 收够包或出错退出循环后，都先请求停止接收。 */
     stop_ret = ioctl(fd, STREAM_IOC_STOP, 0);
-    if (stop_ret < 0)
+    stop_errno = errno;
+
+    /* T2：STOP 返回后立即计时，避免把日志打印算入停止耗时。 */
+    if (clock_gettime(CLOCK_MONOTONIC, &stop_end_time) < 0) {
+        perror("clock_gettime STOP_END");
+        timing_error = 1;
+    }
+    if (stop_ret < 0) {
+        errno = stop_errno;
         perror("ioctl STOP");
+    }
 
     /* 停止后仍保留 fd，用它查询包含清理结果的统计。 */
     stats_ret = ioctl(fd, STREAM_IOC_GET_STATS, &stats);
@@ -413,17 +582,39 @@ int main(int argc, char *argv[])
     if (data_err_cnt || read_err_cnt || stop_ret < 0)
         trace_ret = print_trace(fd);
 
+    if (timings.enabled)
+        profile_ret = print_profile(fd, &timings);
+
     /* 关闭 fd；若 STOP 已完成清理，驱动不重复终止 DMA。 */
     if (close(fd) < 0) {
         perror("close");
         read_err_cnt++;
     }
 
-    printf("success=%u data_error=%u read_error=%u\n",
-           packets - data_err_cnt, data_err_cnt, read_err_cnt);
+    /* 关闭校验时，success 只表示成功读取，不能证明数据内容正确。 */
+    printf("success=%u data_error=%u read_error=%u verify=%s\n",
+           packets - data_err_cnt, data_err_cnt, read_err_cnt,
+           options.verify ? "on" : "off");
+
+    if (!timing_error) {
+        double receive_seconds = elapsed_seconds(&start_time, &receive_end_time);
+        double stop_seconds = elapsed_seconds(&receive_end_time, &stop_end_time);
+        unsigned long long payload_bytes =
+            (unsigned long long)(packets - data_err_cnt) * packet_size;
+
+        /* 校验关闭时只报告读取量；MB 使用十进制的 1000000 字节。 */
+        printf("perf: %s=%llu rx_ms=%.3f stop_ms=%.3f ",
+               options.verify ? "valid_bytes" : "read_bytes", payload_bytes,
+               receive_seconds * 1000.0, stop_seconds * 1000.0);
+        if (receive_seconds > 0.0)
+            printf("throughput_MBps=%.3f\n",
+                   payload_bytes / receive_seconds / 1000000.0);
+        else
+            printf("throughput_MBps=unavailable\n");
+    }
 
     if (data_err_cnt || read_err_cnt || stop_ret < 0 ||
-        stats_ret < 0 || trace_ret < 0)
+        stats_ret < 0 || trace_ret < 0 || timing_error || profile_ret < 0)
         return 1;
     return 0;
 
