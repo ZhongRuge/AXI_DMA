@@ -1445,8 +1445,10 @@ static struct platform_driver stream_ctrl_driver = {
     .probe  = stream_ctrl_probe,
     .remove = stream_ctrl_remove,
     .driver = {
-        .name           = STREAM_CTRL_DRV_NAME,
-        .of_match_table = stream_ctrl_of_match,
+        .name                = STREAM_CTRL_DRV_NAME,
+        .of_match_table      = stream_ctrl_of_match,
+        /* 按静态设备使用，关闭 sysfs 手动绑定、解绑入口。 */
+        .suppress_bind_attrs = true,
     }
 };
 

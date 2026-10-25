@@ -1,4 +1,4 @@
-/* 用户态主线：解析参数 -> open -> 配置/START -> 接收校验 -> STOP -> close。 */
+/* 用户态主线：配置/START -> 接收校验 -> STOP/close -> 输出并追加性能记录。 */
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
@@ -18,6 +18,7 @@
 #define PKT_BUF_SIZE (STREAM_PKT_WORDS_MAX * sizeof(__u32))
 #define DEFAULT_COUNT   100
 #define POLL_TIMEOUT_MS 1000
+#define RESULTS_CSV  "zstream_results.csv"
 
 enum program_command {
     COMMAND_RECEIVE,
@@ -44,12 +45,184 @@ struct user_profile {
     struct stream_timing_sample verify_calls;
 };
 
+/* /proc/stat 第一行的累计 CPU 时间，单位是时钟计数，不是纳秒。 */
+struct cpu_sample {
+    unsigned long long total;
+    unsigned long long busy;
+};
+
+/* 一轮接收的记录；不可用的计时或 CPU 值在 CSV 中留空。 */
+struct run_record {
+    unsigned int packets;
+    unsigned int data_errors;
+    unsigned int read_errors;
+    int profile;
+    int trace;              /* -1 表示未能读取模块开关。 */
+    int timing_ok;
+    int stats_ok;
+    int stop_errno;
+    int run_ok;
+    unsigned long long payload_bytes;
+    unsigned long long cpu_ticks;
+    double receive_seconds;
+    double stop_seconds;
+    double cpu_busy_pct;    /* -1 表示不可用；0 是有效的测量结果。 */
+};
+
 /* 两个单调时间点相减，纳秒部分换算成秒。 */
 static double elapsed_seconds(const struct timespec *begin,
                               const struct timespec *end)
 {
     return (double)(end->tv_sec - begin->tv_sec) +
            (double)(end->tv_nsec - begin->tv_nsec) / 1000000000.0;
+}
+
+/* 读取所有核心的累计时间；guest 已包含在 user/nice 中，不重复相加。 */
+static int read_cpu_sample(struct cpu_sample *sample)
+{
+    unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+    FILE *file;
+    int fields;
+
+    file = fopen("/proc/stat", "r");
+    if (!file)
+        return -1;
+    fields = fscanf(file, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                    &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
+    fclose(file);
+    if (fields != 8)
+        return -1;
+
+    sample->busy = user + nice + system + irq + softirq;
+    sample->total = sample->busy + idle + iowait + steal;
+    return 0;
+}
+
+/* 用累计时间的差计算整机忙碌率；无计数或计数异常时返回 -1。 */
+static double cpu_busy_percent(const struct cpu_sample *begin,
+                               const struct cpu_sample *end,
+                               unsigned long long *ticks)
+{
+    unsigned long long total;
+    unsigned long long busy;
+
+    if (end->total <= begin->total || end->busy < begin->busy)
+        return -1.0;
+    total = end->total - begin->total;
+    busy = end->busy - begin->busy;
+    if (busy > total)
+        return -1.0;
+
+    *ticks = total;
+    return busy * 100.0 / total;
+}
+
+/* 模块参数在加载后只读；读取失败时保留未知值，不猜测开关状态。 */
+static int read_trace_enabled(void)
+{
+    FILE *file;
+    char value = '\0';
+
+    file = fopen("/sys/module/stream_ctrl/parameters/trace", "r");
+    if (!file)
+        return -1;
+    fscanf(file, " %c", &value);
+    fclose(file);
+    if (value == 'Y' || value == 'y' || value == '1')
+        return 1;
+    if (value == 'N' || value == 'n' || value == '0')
+        return 0;
+    return -1;
+}
+
+/* 计时结束后追加 CSV；自动写表头，已有文件的表头必须一致。 */
+static int append_csv(const struct program_options *options,
+                      const struct run_record *record,
+                      const struct stream_rx_stats *stats)
+{
+    static const char header[] =
+        "time_utc,build,packet_words,packet_bytes,target_packets,read_packets,"
+        "success,rate_requested,verify,blocking,profile,trace,payload_bytes,"
+        "rx_ms,stop_ms,throughput_MBps,cpu_busy_pct,cpu_ticks,data_error,read_error,"
+        "driver_rx_packets,discarded,full_pauses,driver_errors,driver_timeouts,"
+        "stop_errno,stats_ok,run_ok\n";
+    char existing_header[sizeof(header)];
+    char timestamp[32] = "";
+    struct tm utc;
+    time_t now = time(NULL);
+    FILE *file;
+    long length;
+    int saved_errno;
+
+    if (now != (time_t)-1 && gmtime_r(&now, &utc))
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc);
+    file = fopen(RESULTS_CSV, "a+");
+    if (!file) {
+        perror(RESULTS_CSV);
+        return -1;
+    }
+    if (fseek(file, 0, SEEK_END) != 0 || (length = ftell(file)) < 0)
+        goto error;
+    if (length == 0) {
+        if (fputs(header, file) == EOF)
+            goto error;
+    } else {
+        rewind(file);
+        if (!fgets(existing_header, sizeof(existing_header), file) ||
+            strcmp(existing_header, header) != 0) {
+            fprintf(stderr, "%s: header differs; use a new results file\n",
+                    RESULTS_CSV);
+            fclose(file);
+            return -1;
+        }
+        if (fseek(file, 0, SEEK_END) != 0)
+            goto error;
+    }
+
+    fprintf(file, "%s,%s,%d,%zu,%d,%u,%u,%d,%d,%d,%d,%d,%llu,",
+            timestamp, __DATE__ " " __TIME__, options->packet_words,
+            (size_t)options->packet_words * sizeof(__u32), options->packet_count,
+            record->packets, record->packets - record->data_errors,
+            options->rate_div, options->verify, options->blocking,
+            record->profile, record->trace, record->payload_bytes);
+    if (record->timing_ok && record->receive_seconds > 0.0) {
+        fprintf(file, "%.3f,%.3f,%.3f,", record->receive_seconds * 1000.0,
+                record->stop_seconds * 1000.0,
+                record->payload_bytes / record->receive_seconds / 1000000.0);
+    } else {
+        fputs(",,,", file);
+    }
+    if (record->cpu_busy_pct >= 0.0)
+        fprintf(file, "%.3f,%llu,", record->cpu_busy_pct, record->cpu_ticks);
+    else
+        fputs(",,", file);
+    fprintf(file, "%u,%u,", record->data_errors, record->read_errors);
+    if (record->stats_ok) {
+        fprintf(file, "%llu,%llu,%llu,%llu,%llu,",
+                (unsigned long long)stats->rx_packets,
+                (unsigned long long)stats->discarded,
+                (unsigned long long)stats->full_pauses,
+                (unsigned long long)stats->errors,
+                (unsigned long long)stats->timeouts);
+    } else {
+        fputs(",,,,,", file);
+    }
+    fprintf(file, "%d,%d,%d\n", record->stop_errno,
+            record->stats_ok, record->run_ok);
+    if (ferror(file))
+        goto error;
+    if (fclose(file) != 0) {
+        perror(RESULTS_CSV);
+        return -1;
+    }
+    return 0;
+
+error:
+    saved_errno = errno;
+    fclose(file);
+    errno = saved_errno;
+    perror(RESULTS_CSV);
+    return -1;
 }
 
 /* 取得纳秒时间戳；计时失败只停止采集，不打断接收和清理。 */
@@ -352,6 +525,7 @@ static void print_usage(const char *program)
             "  --no-verify: skip content checks for a throughput comparison.\n"
             "  Stage timings: load stream_ctrl.ko with profile=1.\n"
             "  Event logging: load stream_ctrl.ko with trace=1 (default off).\n"
+            "  Receive results append to " RESULTS_CSV " in the current directory.\n"
             "  trace: view saved history without starting reception.\n"
             "  reset: reset reception and discard saved history; do not start.\n",
             program, program, program, DEFAULT_COUNT,
@@ -425,7 +599,11 @@ int main(int argc, char *argv[])
     size_t packet_size;
     struct timespec start_time;
     struct timespec receive_end_time;
+    struct timespec stop_begin_time;
     struct timespec stop_end_time;
+    struct cpu_sample cpu_begin;
+    struct cpu_sample cpu_end;
+    struct run_record record = { .trace = -1, .cpu_busy_pct = -1.0 };
     struct stream_rx_stats stats;
     struct stream_profile_stats driver_profile;
     struct user_profile timings = {0};
@@ -443,6 +621,9 @@ int main(int argc, char *argv[])
     int trace_ret = 0;
     int profile_ret = 0;
     int timing_error = 0;
+    int cpu_begin_ok;
+    int cpu_end_ok;
+    int csv_ret;
     int open_flags;
     int fd;
 
@@ -519,6 +700,11 @@ int main(int argc, char *argv[])
         }
     }
 
+    record.profile = driver_profile.enabled;
+    record.trace = read_trace_enabled();
+    /* CPU 累计值在接收窗口两侧采样，文件读取不计入吞吐时间。 */
+    cpu_begin_ok = (read_cpu_sample(&cpu_begin) == 0);
+
     /* T0：计时从 START 前开始，包含启动、接收和校验。 */
     if (clock_gettime(CLOCK_MONOTONIC, &start_time) < 0) {
         perror("clock_gettime START");
@@ -558,8 +744,13 @@ int main(int argc, char *argv[])
         perror("clock_gettime RECEIVE_END");
         timing_error = 1;
     }
+    cpu_end_ok = (read_cpu_sample(&cpu_end) == 0);
 
-    /* 收够包或出错退出循环后，都先请求停止接收。 */
+    /* STOP 单独计时，不把 CPU 采样的开销算进停止耗时。 */
+    if (clock_gettime(CLOCK_MONOTONIC, &stop_begin_time) < 0) {
+        perror("clock_gettime STOP_BEGIN");
+        timing_error = 1;
+    }
     stop_ret = ioctl(fd, STREAM_IOC_STOP, 0);
     stop_errno = errno;
 
@@ -597,30 +788,50 @@ int main(int argc, char *argv[])
         read_err_cnt++;
     }
 
+    record.packets = packets;
+    record.data_errors = data_err_cnt;
+    record.read_errors = read_err_cnt;
+    record.payload_bytes =
+        (unsigned long long)(packets - data_err_cnt) * packet_size;
+    record.stats_ok = (stats_ret == 0);
+    record.stop_errno = stop_ret < 0 ? stop_errno : 0;
+    record.timing_ok = !timing_error;
+    record.run_ok = !(data_err_cnt || read_err_cnt || stop_ret < 0 ||
+                      stats_ret < 0 || trace_ret < 0 || timing_error || profile_ret < 0 ||
+                      (record.stats_ok && (stats.errors || stats.timeouts)));
+
     /* 关闭校验时，success 只表示成功读取，不能证明数据内容正确。 */
     printf("success=%u data_error=%u read_error=%u verify=%s\n",
            packets - data_err_cnt, data_err_cnt, read_err_cnt,
            options.verify ? "on" : "off");
 
     if (!timing_error) {
-        double receive_seconds = elapsed_seconds(&start_time, &receive_end_time);
-        double stop_seconds = elapsed_seconds(&receive_end_time, &stop_end_time);
-        unsigned long long payload_bytes =
-            (unsigned long long)(packets - data_err_cnt) * packet_size;
+        record.receive_seconds = elapsed_seconds(&start_time, &receive_end_time);
+        record.stop_seconds = elapsed_seconds(&stop_begin_time, &stop_end_time);
+        if (cpu_begin_ok && cpu_end_ok)
+            record.cpu_busy_pct = cpu_busy_percent(&cpu_begin, &cpu_end,
+                                                   &record.cpu_ticks);
 
         /* 校验关闭时只报告读取量；MB 使用十进制的 1000000 字节。 */
         printf("perf: %s=%llu rx_ms=%.3f stop_ms=%.3f ",
-               options.verify ? "valid_bytes" : "read_bytes", payload_bytes,
-               receive_seconds * 1000.0, stop_seconds * 1000.0);
-        if (receive_seconds > 0.0)
-            printf("throughput_MBps=%.3f\n",
-                   payload_bytes / receive_seconds / 1000000.0);
+               options.verify ? "valid_bytes" : "read_bytes", record.payload_bytes,
+               record.receive_seconds * 1000.0, record.stop_seconds * 1000.0);
+        if (record.receive_seconds > 0.0)
+            printf("throughput_MBps=%.3f ",
+                   record.payload_bytes / record.receive_seconds / 1000000.0);
         else
-            printf("throughput_MBps=unavailable\n");
+            printf("throughput_MBps=unavailable ");
+        if (record.cpu_busy_pct >= 0.0)
+            printf("cpu_busy_pct=%.3f cpu_ticks=%llu\n",
+                   record.cpu_busy_pct, record.cpu_ticks);
+        else
+            printf("cpu_busy_pct=unavailable\n");
     }
 
-    if (data_err_cnt || read_err_cnt || stop_ret < 0 ||
-        stats_ret < 0 || trace_ret < 0 || timing_error || profile_ret < 0)
+    csv_ret = append_csv(&options, &record, &stats);
+    if (csv_ret == 0)
+        printf("csv: " RESULTS_CSV "\n");
+    if (!record.run_ok || csv_ret < 0)
         return 1;
     return 0;
 
