@@ -194,6 +194,11 @@ static int print_trace(int fd)
         return -1;
     }
     if (ioctl(fd, STREAM_IOC_GET_TRACE, trace) < 0) {
+        if (errno == EOPNOTSUPP) {
+            printf("trace: disabled; load stream_ctrl.ko with trace=1 to record events\n");
+            free(trace);
+            return 0;
+        }
         perror("ioctl GET_TRACE");
         free(trace);
         return -1;
@@ -346,6 +351,7 @@ static void print_usage(const char *program)
             "  --blocking: use blocking read instead of poll.\n"
             "  --no-verify: skip content checks for a throughput comparison.\n"
             "  Stage timings: load stream_ctrl.ko with profile=1.\n"
+            "  Event logging: load stream_ctrl.ko with trace=1 (default off).\n"
             "  trace: view saved history without starting reception.\n"
             "  reset: reset reception and discard saved history; do not start.\n",
             program, program, program, DEFAULT_COUNT,

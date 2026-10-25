@@ -30,6 +30,11 @@ static bool profile;
 module_param(profile, bool, 0444);
 MODULE_PARM_DESC(profile, "Collect stage timings (default: off)");
 
+/* 事件历史独立于分段计时，默认关闭；排障时加载模块加 trace=1。 */
+static bool trace_enabled;
+module_param_named(trace, trace_enabled, bool, 0444);
+MODULE_PARM_DESC(trace, "Record diagnostic events (default: off)");
+
 /* 前置声明：便于按阅读顺序排列函数，不执行操作。 */
 static void stream_ctrl_free_buffers(struct stream_ctrl_dev *sdev);
 static void stream_ctrl_dma_callback(void *args);
@@ -1139,7 +1144,7 @@ static void stream_ctrl_trace_locked(struct stream_ctrl_dev *sdev,
     struct stream_trace_entry *entry;
     u64 begin_ns;
 
-    if (sdev->trace.frozen)
+    if (!trace_enabled || sdev->trace.frozen)
         return;
 
     begin_ns = stream_ctrl_profile_now();
@@ -1174,6 +1179,9 @@ static void stream_ctrl_trace(struct stream_ctrl_dev *sdev,
 {
     unsigned long flags;
 
+    if (!trace_enabled)
+        return;
+
     spin_lock_irqsave(&sdev->state_lock, flags);
     stream_ctrl_trace_locked(sdev, buf, event, result, detail);
     spin_unlock_irqrestore(&sdev->state_lock, flags);
@@ -1188,6 +1196,9 @@ static int stream_ctrl_get_trace(struct stream_ctrl_dev *sdev,
     unsigned int first;
     unsigned int i;
     int ret;
+
+    if (!trace_enabled)
+        return -EOPNOTSUPP;
 
     /* 历史较大，不放在内核栈上；只在用户查询时分配。 */
     snapshot = kzalloc(sizeof(*snapshot), GFP_KERNEL);
